@@ -1,0 +1,20 @@
+## IDF Component Manager Manifest File
+dependencies:
+  espressif/esp_wifi_remote:
+    version: "0.16.3"
+
+  # Pin esp_hosted to the 2.x line (same protocol family as the frame firmware shipped
+  # with Waveshare's demo). 3.x changes the host/slave firmware pairing, so do not float it.
+  espressif/esp_hosted:
+    version: "2.12.13"
+
+  espressif/esp-brookesia:
+    version: "0.4.*"
+
+  esp_video:
+    version: "0.8.*"
+    public: true
+
+  espressif/esp_h264:
+      version: "==1.0.3"
+      public: true

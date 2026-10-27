@@ -1,0 +1,107 @@
+menu "MKLink Remote"
+
+    config MKLINK_WIFI_AP_SSID
+        string "SoftAP SSID"
+        default "MKLink-Remote"
+        help
+            Hotspot name used for the direct (phone/PC to board) link.
+
+    config MKLINK_WIFI_AP_PASSWORD
+        string "SoftAP password (at least 8 characters)"
+        default "mklink1234"
+        help
+            WPA2 password of the SoftAP. Leave empty for an open network.
+
+    config MKLINK_WIFI_AP_CHANNEL
+        int "SoftAP channel"
+        range 1 13
+        default 6
+
+    config MKLINK_WIFI_AP_MAX_CONN
+        int "SoftAP maximum clients"
+        range 1 8
+        default 4
+
+    config MKLINK_WIFI_STA_AUTOCONNECT
+        bool "Reconnect to the saved station network on boot"
+        default y
+
+    config MKLINK_USB_VID
+        hex "USB probe VID filter (0 = match any device)"
+        default 0x0
+        help
+            Set once the MKLINK probe VID is known. 0 keeps the bridge open to any
+            device and dumps its descriptors, which is the bring-up mode.
+
+    config MKLINK_USB_PID
+        hex "USB probe PID filter (0 = match any device)"
+        default 0x0
+
+    config MKLINK_PROBE_VID
+        hex "MKLINK probe VID (auto-discovery fast path)"
+        default 0x0D28
+        help
+            VID/PID of the MKLink probe. When a device matches both values *and*
+            exposes a CDC interface with the command interface number below, it is
+            adopted without sending a single byte (same as the official MI_04
+            fast path). Set to 0 to always fall back to identity probing.
+
+    config MKLINK_PROBE_PID
+        hex "MKLINK probe PID (auto-discovery fast path)"
+        default 0x0202
+
+    config MKLINK_PROBE_CMD_IFACE
+        int "MKLINK command interface number"
+        range 0 31
+        default 4
+        help
+            Interface number of the CDC function that carries the Python REPL.
+            Official V3/V4 firmware exposes it as MI_04; the value is only a hint,
+            discovery probes the remaining CDC groups when the fast path fails.
+
+    config MKLINK_PROBE_ENABLE
+        bool "Run the local probe REPL bridge (RTT / SuperWatch command channel)"
+        default y
+        help
+            The REPL reader claims the command CDC interfaces and polls the bulk IN
+            endpoint. Turn this OFF when the usbip server exports the probe: the
+            pending bulk IN never times out on the host controller, so the interface
+            cannot be cleanly released and the next usbip claim fails with
+            "EP with X address already allocated".
+
+    config MKLINK_CDC_TEST_ENABLE
+        bool "Run a CDC loopback test when a serial device is attached"
+        default n
+        help
+            Disable this when the usbip server takes over the interfaces, so no
+            local driver claims them. The test also leaves the CDC endpoints in a
+            state that makes the next usbip claim fail, so it is off by default.
+
+    config MKLINK_CDC_TEST_PAYLOAD
+        string "CDC loopback payload"
+        default "MKLINK-REMOTE-CDC"
+
+    config MKLINK_STREAM_PORT
+        int "TCP stream hub port (RTT / dump fan-out for the PC)"
+        range 1024 65535
+        default 8081
+
+    config MKLINK_NET_PORT
+        int "TCP status service port"
+        range 1024 65535
+        default 8080
+
+    config MKLINK_USBIP_PORT
+        int "usbip server port (USB over IP passthrough)"
+        range 1 65535
+        default 3240
+        help
+            Standard Linux usbip port. On the PC: usbip attach -r <IP> -b 1-1
+
+    config MKLINK_USBIP_AUTOSTART
+        bool "Start the usbip server on boot"
+        default n
+        help
+            Enable to export the probe over usbip without touching the panel.
+
+endmenu

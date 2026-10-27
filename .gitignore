@@ -1,0 +1,14 @@
+# ESP-IDF build output
+build/
+managed_components/
+
+# Generated config (sdkconfig.defaults is the source of truth)
+sdkconfig
+sdkconfig.old
+
+# IDE / agent local data
+.codebuddy/
+*.log
+__pycache__/
+*.pyc
+.DS_Store

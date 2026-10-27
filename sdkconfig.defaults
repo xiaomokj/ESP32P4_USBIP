@@ -1,0 +1,141 @@
+# This file was generated using idf.py save-defconfig. It can be edited manually.
+# Espressif IoT Development Framework (ESP-IDF) 5.5.0 Project Minimal Configuration
+#
+CONFIG_IDF_TARGET="esp32p4"
+# Waveshare ESP32-P4-WIFI6-Touch-LCD-4B ships ESP32-P4 silicon revision v1.x
+# (IDF 5.5.5 defaults to rev v3.x support, which is mutually exclusive)
+CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
+CONFIG_ESP32P4_REV_MIN_1=y
+CONFIG_ESP32P4_REV_MIN_FULL=1
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_OFFSET=0x9000
+CONFIG_EXAMPLE_ENABLE_CAM_SENSOR_PIC_VFLIP=n
+CONFIG_EXAMPLE_ENABLE_CAM_SENSOR_PIC_HFLIP=n
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+CONFIG_COMPILER_ORPHAN_SECTIONS_PLACE=y
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_SPEED_200M=y
+CONFIG_SPIRAM_XIP_FROM_PSRAM=y
+CONFIG_SPIRAM_USE_CAPS_ALLOC=y
+CONFIG_CACHE_L2_CACHE_256KB=y
+CONFIG_CACHE_L2_CACHE_LINE_128B=y
+CONFIG_ESP_SYSTEM_PANIC_PRINT_HALT=y
+CONFIG_FATFS_LFN_HEAP=y
+CONFIG_FREERTOS_HZ=1000
+CONFIG_FREERTOS_VTASKLIST_INCLUDE_COREID=y
+CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y
+CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM=n
+# Faster serial log (CH343 bridge supports well above this). Flash runs at 2 Mbps.
+CONFIG_ESP_CONSOLE_UART_BAUDRATE=921600
+CONFIG_VFS_MAX_COUNT=15
+CONFIG_ESP_BROOKESIA_LOG_STYLE_STD=y
+CONFIG_ESP_BROOKESIA_MEMORY_USE_CUSTOM=y
+CONFIG_BSP_LCD_DPI_BUFFER_NUMS=2
+CONFIG_BSP_DISPLAY_LVGL_AVOID_TEAR=y
+CONFIG_BSP_DISPLAY_LVGL_DIRECT_MODE=y
+CONFIG_CAMERA_OV5647=y
+CONFIG_CAMERA_OV5647_AUTO_DETECT=y
+CONFIG_CAMERA_OV5647_AUTO_DETECT_MIPI_INTERFACE_SENSOR=y
+CONFIG_CAMERA_OV5647_MIPI_RAW8_800x800_50FPS=y
+CONFIG_CAMERA_OV5647_MIPI_IF_FORMAT_INDEX_DAFAULT=2
+CONFIG_CAMERA_OV5647_CSI_LINESYNC_ENABLE=y
+CONFIG_CAMERA_OV5647_ISP_AF_ENABLE=y
+CONFIG_CAMERA_OV5647_DEFAULT_IPA_JSON_CONFIGURATION_FILE=y
+CONFIG_ESP_VIDEO_ENABLE_DVP_VIDEO_DEVICE=n
+CONFIG_ESP_VIDEO_ENABLE_ISP_PIPELINE_CONTROLLER=y
+CONFIG_LV_COLOR_SCREEN_TRANSP=y
+CONFIG_LV_MEM_CUSTOM=y
+CONFIG_LV_MEM_CUSTOM_INCLUDE="esp_heap_caps.h"
+CONFIG_LV_MEMCPY_MEMSET_STD=y
+CONFIG_LV_CIRCLE_CACHE_SIZE=10
+CONFIG_LV_LAYER_SIMPLE_BUF_SIZE=102400
+CONFIG_LV_IMG_CACHE_DEF_SIZE=20
+CONFIG_LV_GRAD_CACHE_DEF_SIZE=10240
+CONFIG_LV_ATTRIBUTE_FAST_MEM_USE_IRAM=y
+CONFIG_LV_FONT_MONTSERRAT_8=y
+CONFIG_LV_FONT_MONTSERRAT_10=y
+CONFIG_LV_FONT_MONTSERRAT_12=y
+CONFIG_LV_FONT_MONTSERRAT_16=y
+CONFIG_LV_FONT_MONTSERRAT_18=y
+CONFIG_LV_FONT_MONTSERRAT_20=y
+CONFIG_LV_FONT_MONTSERRAT_22=y
+CONFIG_LV_FONT_MONTSERRAT_24=y
+CONFIG_LV_FONT_MONTSERRAT_26=y
+CONFIG_LV_FONT_MONTSERRAT_28=y
+CONFIG_LV_FONT_MONTSERRAT_30=y
+CONFIG_LV_FONT_MONTSERRAT_32=y
+CONFIG_LV_FONT_MONTSERRAT_34=y
+CONFIG_LV_FONT_MONTSERRAT_36=y
+CONFIG_LV_FONT_MONTSERRAT_38=y
+CONFIG_LV_FONT_MONTSERRAT_40=y
+CONFIG_LV_FONT_MONTSERRAT_42=y
+CONFIG_LV_FONT_MONTSERRAT_44=y
+CONFIG_LV_FONT_MONTSERRAT_46=y
+CONFIG_LV_FONT_MONTSERRAT_48=y
+CONFIG_LV_USE_MONKEY=y
+CONFIG_LV_USE_DEMO_WIDGETS=y
+CONFIG_LV_USE_DEMO_BENCHMARK=y
+CONFIG_LV_USE_DEMO_STRESS=y
+CONFIG_IDF_EXPERIMENTAL_FEATURES=y
+CONFIG_SPI_FLASH_SUPPORT_GD_CHIP=y
+CONFIG_ESPTOOLPY_FLASHSIZE_32MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="32MB"
+CONFIG_SLAVE_IDF_TARGET_ESP32C6=y
+
+# ==============================================================================
+# MKLink Remote: ESP32-C6 co-processor (esp_hosted / esp_wifi_remote)
+# SDIO 4-bit, slot 1, clocks/pins verified on Waveshare ESP32-P4-WIFI6-Touch-LCD-4B
+# ==============================================================================
+CONFIG_ESP_HOSTED_ENABLED=y
+CONFIG_ESP_HOSTED_P4_DEV_BOARD_NONE=y
+CONFIG_ESP_HOSTED_SDIO_HOST_INTERFACE=y
+CONFIG_ESP_HOSTED_SDIO_SLOT_1=y
+CONFIG_ESP_HOSTED_SDIO_4_BIT_BUS=y
+CONFIG_ESP_HOSTED_SDIO_CLOCK_FREQ_KHZ=40000
+CONFIG_ESP_HOSTED_PRIV_SDIO_PIN_CMD_SLOT_1=19
+CONFIG_ESP_HOSTED_PRIV_SDIO_PIN_CLK_SLOT_1=18
+CONFIG_ESP_HOSTED_PRIV_SDIO_PIN_D0_SLOT_1=14
+CONFIG_ESP_HOSTED_PRIV_SDIO_PIN_D1_4BIT_BUS_SLOT_1=15
+CONFIG_ESP_HOSTED_PRIV_SDIO_PIN_D2_4BIT_BUS_SLOT_1=16
+CONFIG_ESP_HOSTED_PRIV_SDIO_PIN_D3_4BIT_BUS_SLOT_1=17
+CONFIG_ESP_HOSTED_SDIO_GPIO_RESET_SLAVE=54
+CONFIG_ESP_HOSTED_SDIO_RESET_ACTIVE_HIGH=y
+CONFIG_ESP_HOSTED_SDIO_RESET_DELAY_MS=1500
+CONFIG_ESP_HOSTED_SDIO_OPTIMIZATION_RX_STREAMING_MODE=y
+# esp_hosted 2.12's SDIO mempool is UNUSABLE on this board: the pool cannot be
+# satisfied from internal DMA RAM after the display/LVGL setup, and when it is
+# forced into PSRAM the transport dies (H_SDIO_DRV: Unrecoverable host sdio
+# state, 1-8 s after the station gets an IP). Plain heap allocation per transfer
+# is stable - verified 40 MHz / 4-bit, 150 s soak, zero errors.
+# CONFIG_ESP_HOSTED_USE_MEMPOOL is not set
+# CONFIG_ESP_HOSTED_MEMPOOL_PREFER_SPIRAM is not set
+CONFIG_ESP_HOSTED_SDIO_RX_Q_SIZE=10
+CONFIG_ESP_HOSTED_SDIO_TX_Q_SIZE=10
+
+# ==============================================================================
+# MKLink Remote: USB Host (probe passthrough)
+# ==============================================================================
+CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE=1024
+# The CDC loopback test is a bring-up aid only. When the usbip server exports the
+# probe, it must be off: the test claims/releases the CDC interfaces and leaves
+# their endpoints in a state that makes the next usbip claim fail with
+# "EP with X address already allocated".
+CONFIG_MKLINK_CDC_TEST_ENABLE=n
+# usbip mode: the local REPL bridge polls the command CDC bulk IN (which never
+# times out on this host controller), so it cannot release its interface cleanly
+# and breaks the usbip claim. Disable it so the probe stays unclaimed for usbip.
+CONFIG_MKLINK_PROBE_ENABLE=n
+
+# ==============================================================================
+# MKLink Remote: CJK font for WiFi SSID / log display
+# ==============================================================================
+# The built-in SimSun CJK font only carries ~1400 glyphs and misses most of the
+# characters used by MkLinkApp, so a project font is generated instead:
+#   python3 tools/gen_font.py  ->  components/apps/mklink/assets/mklink_font_cjk_16.c
+# It is a plain (non compressed) 16 px / 4 bpp font, hence no LV_USE_FONT_COMPRESSED.
+# CONFIG_LV_FONT_SIMSUN_16_CJK is not set
+# On-screen CPU/FPS overlay, used to verify the tab-switch / RTT terminal
+# optimisation (turn off once the numbers are recorded).
+CONFIG_LV_USE_PERF_MONITOR=y
