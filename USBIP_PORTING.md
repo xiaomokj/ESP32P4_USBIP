@@ -53,7 +53,7 @@ static int send_import_reply(int s)
 
 **原因**：`struct usbip_usb_device` 是 312 字节：`path[256] + busid[32] + busnum/devnum/speed(各 4) + idVendor/idProduct/bcdDevice(各 2) + 6 个 u8`。`pack_usb_device()` 只转换 6 个多字节字段（busnum/devnum/speed/idVendor/idProduct/bcdDevice），u8 字段不动。
 
-**解决**：`devinfo` 的打包方式直接照抄内核；`busid` 用固定字符串（本项目写死 `"1-1"`，与 `path` 无关），PC 端 `-b 1-1` 就是靠它匹配。
+**解决**：`devinfo` 的打包方式直接照抄内核；`busid` 是与 `path` 无关的稳定字符串（本项目为物理端口路径 `1-1` / `1-1.2`，见坑 21），PC 端 `-b` 就是靠它匹配。
 
 ### 坑 4：`RET_SUBMIT` 的 direction / ep / actual_length
 
@@ -229,9 +229,9 @@ CONFIG_USB_HOST_HUB_MULTI_LEVEL=y      # 允许多级 HUB 串联
 
 **解决**：通用网关模式下放宽采纳条件——**非 HUB、且通过 VID/PID 过滤的设备一律采纳**；CDC 设备即使探针校验失败也保留（不再 discard）。
 
-### 坑 14.3：全速/低速设备挂在高速 HUB 下必然失败（TT 未实现）⭐
+### 坑 14.3：全速/低速设备挂在高速 HUB 下必然失败（TT 未实现）⭐ 已解决
 
-**现象**：HUB 支持开了之后，HS 设备（U 盘、千兆网卡、CMSIS-DAP 探针）都能枚举，但**键鼠、CH340 串口、Saleae 逻辑分析仪、多数调试器**等全速设备完全不出现：
+**现象**（换栈前）：HUB 支持开了之后，HS 设备（U 盘、千兆网卡、CMSIS-DAP 探针）都能枚举，但**键鼠、CH340 串口、Saleae 逻辑分析仪、多数调试器**等全速设备完全不出现：
 
 ```
 E HUB: Connected device is FS, transaction translator (TT) is not supported
@@ -239,7 +239,7 @@ E EXT_PORT: [1:2] Port disabled, reset attempts=1
 W HUB: Device tree node (parent_port=2): not found
 ```
 
-**原因**：USB 2.0 高速 HUB 下游接 Full-Speed / Low-Speed 设备时，必须由 HUB 的 **TT（Transaction Translator）** 做 HS↔FS 速度转换。ESP-IDF 的 `components/usb/hub.c` 里是**硬编码判断 + 直接禁用端口**：
+**原因**：USB 2.0 高速 HUB 下游接 Full-Speed / Low-Speed 设备时，必须由 HUB 的 **TT（Transaction Translator）** 把 HS 令牌拆成 FS/LS 事务（SSPLIT / CSPLIT）。ESP-IDF 的 `components/usb/hub.c` 里是**硬编码判断 + 直接禁用端口**：
 
 ```c
 if (parent_dev_info.speed == USB_SPEED_HIGH) {
@@ -250,18 +250,16 @@ if (parent_dev_info.speed == USB_SPEED_HIGH) {
 }
 ```
 
-**没有任何 Kconfig 可以打开**（`USB_HOST_HUBS_SUPPORTED` 只管 HUB 本身，不管 TT）。截至 IDF 5.5.x 仍未实现 TT 调度。
+**没有任何 Kconfig 可以打开**（`USB_HOST_HUBS_SUPPORTED` 只管 HUB 本身，不管 TT），ESP-IDF 5.5.5 的 `hcd_dwc.c` 里也没有任何 SSPLIT/CSPLIT 代码。
 
-**解决 / 规避**：
+**解决（2026-10-28）**：主机栈整体换成 **CherryUSB 1.5.2**（vendor 到 `components/cherryusb`）。它的 dwc2 端口在 `usb_hc_urb_enqueue()` 里对 `speed != HIGH && 根端口为 HIGH` 的 URB 置 `do_ssplit/do_csplit`，写 `HCSPLT`（SPLITEN/HUBADDR/PRT/COMPLSPLT），低速设备再置 `HCCHAR.LSDEV`，通道中断里有 CSPLIT 重试；`class/hub/usbh_hub.c` 负责端口复位、速率判定、TT think。实机已验证：
 
-| 方案 | 说明 |
-| --- | --- |
-| **FS 设备直连 ESP32** | 不经 HUB，单设备完全正常（推荐） |
-| **用 USB 1.1 全速 HUB** | HUB 自身以 FS 枚举时该检查被跳过，FS 设备可用；代价是 HS 设备被降速到 12 Mbps |
-| **混合拓扑** | HS 设备走现有高速 HUB，FS/LS 设备（键鼠、串口、音频、逻辑分析仪）直连 |
-| 改 IDF 源码实现 TT | 工作量大（需实现 TT 调度/分裂事务），不建议 |
+- 高速 HUB（`05e3:0610`）下游 **FS 设备** `1209:1301 "BAT CMSIS-DAP"` 正常枚举并透传（`devlist` 里 `speed=FS`，控制/批量传输与 UNLINK 全部通过）。
+- 同一 HUB 下 HS 设备（`8312:8a02`、`0bda:8153`）不受影响。
 
-> 判断设备速度：串口日志 `USB: ... addr=N` 前后的 `ENUM:` 行，或看 HUB 报的是 `FS` / `LS` 还是 `HS`。
+细节见文末「七、USB 主机栈迁移到 CherryUSB」。
+
+> 判断设备速度：看 `usbip list` 输出的 `speed=`（LS/FS/HS），或串口 `[I/usbh_hub] New full-speed device on Bus 0, Hub 2, Port 1`。
 
 ### 坑 15：单路 USB PHY 只能二选一（Host / Device）
 
@@ -307,7 +305,13 @@ if (parent_dev_info.speed == USB_SPEED_HIGH) {
 
 ### 坑 21：busid 与 devid
 
-**解决**：`busid` 固定 `"1-1"`（PC 端 `-b 1-1`）；`devid = (busnum << 16) | devnum`，本项目 `0x00010001`，`RET_SUBMIT` 里回同样的值即可（Linux 客户端只用它路由，单设备时不会严格校验）。
+**现象（2026-10-28 修）**：早期 `busid` 用 `"1-<USB地址>"`（`dev_addr`）拼。地址是 CherryUSB 每次枚举动态分配的，**HUB 或设备一重插，`usbip list` 里的 `-b` 值就变了**，PC 端必须重新 list。
+
+**解决**：
+
+- `busid` 改为**物理端口路径**：`1-<根端口>[.<HUB端口>...]`，直插板载口 `1-1`，高速 HUB 第 2 口 `1-1.2`。拓扑来自 `usbh_hubport.port` 与 `usbh_hub.parent`（自身向上递归，根 hub 的 `parent == NULL`），在 adopt 时算一次缓存进设备槽位，`devlist/import/path/日志` 全部用它。同一物理口重插 busid 不变，换口才变。
+- `devid` 仍是 `(busnum << 16) | devnum`（`devnum` 用动态地址），`RET_SUBMIT` 原样回显；busid **只做外部标识，不参与 URB 路由**。
+- 不保留旧 `1-<addr>` 别名（已与用户确认）。
 
 ### 坑 22：bulk IN 超时给足
 
@@ -328,3 +332,105 @@ if (parent_dev_info.speed == USB_SPEED_HIGH) {
 | `vhci driver is not loaded` | Secure Boot / 驱动没装 | BIOS Secure Boot、`pnputil` 列表 |
 | `list` 空列表 | 设备没上电/没枚举 | 串口有没有 `USB: VID:PID` 日志 |
 | WiFi 跑流量就重启 | SDIO mempool / C6 固件不匹配 | `USE_MEMPOOL=n`、C6 版本 |
+| HUB 下游设备开机不出现 | HUB 只在插拔时报 C_PORT_CONNECTION | 是否打了「开机扫描端口」补丁 |
+| 重插后 `-b` 值对不上 | 换到了另一个物理口（busid = 端口路径） | `usbip list` 里的 busid 是否变成新口 |
+| `STA TX: mempool_alloc failed` | 内部 RAM 被 USB 表挤干 | `USB: internal heap ...` 日志、`MAX_EHPORTS` |
+
+---
+
+## 七、USB 主机栈迁移到 CherryUSB（2026-10-28）
+
+### 为什么换
+
+IDF `usb_host` 不支持 USB 2.0 HUB 的 TT / 拆分事务（见坑 14.3），高速 HUB 下游的 FS/LS 设备永远枚举不出来，且没有 Kconfig 可开。CherryUSB 的 dwc2 主机端口已实现 SPLIT/CSPLIT 与 TT think，代价是整条主机栈要换。
+
+### 目录与补丁
+
+`components/cherryusb/` 是从 registry 缓存包 `cherry-embedded/cherryusb 1.5.2~2` 里**选择性 vendor** 的精简子集（只留主机核心 + hub class + dwc2 端口），并打了这些补丁：
+
+| 文件 | 补丁 | 原因 |
+| --- | --- | --- |
+| `core/usbh_core.c/.h` | 新增 `usbh_device_connected_cb()` / `usbh_device_disconnected_cb()` 弱钩子 | 上游没有任何"设备已枚举/已移除"的公共回调，usbip 需要它把设备入表 |
+| `class/hub/usbh_hub.c` | 枚举成功后调 connected 钩子；把端口复位+枚举抽成 `usbh_hub_port_connect()`；**hub 初始化后扫描一遍所有端口** | HUB 只在插拔时上报 `C_PORT_CONNECTION`，主板复位而 HUB 仍供电时，已挂着的设备永远不会被枚举（实测漏掉全部下游设备） |
+| `class/hub/usbh_hub.c` | `bNbrPorts` 超过 `CONFIG_USBHOST_MAX_EHPORTS` 时截断并报错 | 端口表是静态数组，7 口 HUB 会直接写越界 |
+| `port/dwc2/usb_hc_dwc2.c` | `dwc2_inchan_irq_handler()` 里 `chan->urb == NULL` 直接返回 | `usbh_kill_urb()`（usbip UNLINK）会在任务里释放通道，随后到达的 CHH 中断会解引用空 URB（实测 `Load access fault`，MEPVAL=0xC） |
+| `osal/idf/usb_config.h` | 放宽 `MAX_INTERFACES=8`、`MAX_ENDPOINTS=6`、`MAX_EHPORTS=4`、`MAX_EXTHUBS=1`、控制超时 1 s、hub 线程优先级 5；P4 的 `CONFIG_USBHOST_MAX_BUS=1` | 探针是 8 接口复合设备；但每加一个 HUB 端口约 1 KB `.bss`，内部 RAM 非常紧张（见下） |
+
+### 上层适配（`components/mklink_core`）
+
+- `mklink_usb.c`：设备表改成以 `struct usbh_hubport *` 为句柄；描述符不再 open/close，而是枚举完成后从 `hport->config` 解析，并在 adopt 时用 `usbh_control_transfer()` 读一次原始配置描述符缓存进槽位（usbip `devlist`/`import` 用）。`claim/release interface` 变成纯记账（CherryUSB 没这个概念，没绑 class driver 就天然独占）。
+- `mklink_usb_raw.c`：`usbh_submit_urb(timeout=0)` 异步提交 + ISR 只入队 + 专用 worker 做 memcpy/回调/释放；每个 URB 用一个 `esp_timer` 实现 usbip 的超时；控制传输走独立 worker 串行化（EP0 只有一个 URB）；`mklink_usb_raw_unlink_all()` 会等所有完成回调真正投递完（否则 usbip 会 free 掉回调里的上下文）。
+- `mklink_usbip.c`：描述符/速率改走 `mklink_usb_device_desc/config_desc/device_speed`，`speed` 直接上报 usbip 的 1=LS / 2=FS / 3=HS；`ESP_ERR_NOT_SUPPORTED` 映射成 `-EPIPE`。
+- **不编译任何 CherryUSB class driver（除 hub）**：`usbh_enumerate()` 找不到驱动只是 `continue`，返回仍然成功，设备保持"裸挂"，usbip 才能拿到全部端点。
+
+### 两个必踩的坑
+
+**① DMA 缓冲区必须按 cache line（64 B）对齐**
+
+P4 强制 `CONFIG_USB_DCACHE_ENABLE`，dwc2 在提交/完成时对 `setup` 和 `transfer_buffer` 做 `esp_cache_msync()`，而 `usbh_submit_urb()` 里有断言：
+
+```c
+USB_ASSERT_MSG(!((uintptr_t)urb->setup % CONFIG_USB_ALIGN_SIZE) && ...
+```
+
+断言失败不是报错而是 **死循环**（任务看门狗刷屏）。所有传给 URB 的缓冲区都要 `heap_caps_aligned_alloc(CONFIG_USB_ALIGN_SIZE, ...)`，栈上的要 `__attribute__((aligned(CONFIG_USB_ALIGN_SIZE)))`，并且长度向上取整到 64（否则 msync 会碰到邻居 cache line）。上游 `usbh_control_transfer()` 返回的 `actual_length` **包含 8 字节 setup 包**，解析配置描述符时要用 `min(len, wTotalLength)` 截断。
+
+**② 内部 RAM 是硬约束：USB 表会饿死 esp_hosted**
+
+`struct usbh_bus` = 9.5 KB，每个外部 HUB 再 9.5 KB（`g_hub_class[]`），而 `CONFIG_USBHOST_MAX_EHPORTS` 每加一个端口就多约 1 KB。最初按 `EHPORTS=8 / EXTHUBS=2` 配，`.bss` 直接吃掉 ~28 KB，结果：
+
+- `devlist` 最后 4 字节发不出去（TCP 发送缓存分配失败）；
+- WiFi 完全断掉，串口刷 `W transport: STA TX: mempool_alloc failed, dropping pkt (len=62)`。
+
+原因是 esp_hosted 在 `CONFIG_ESP_HOSTED_MEMPOOL_PREFER_SPIRAM=n` 时用 `heap_caps_aligned_alloc(64, 1600, MALLOC_CAP_INTERNAL|MALLOC_CAP_DMA)` 分配每个 WiFi TX 包，内部 DMA RAM 被 USB 静态表挤干后整条 WiFi 数据面就死了。改成 `EHPORTS=4 / EXTHUBS=1`（省 ~19 KB）后全部恢复正常；开机日志会打印实际余量：
+
+```
+I (...) mklink: USB: internal heap 75660 B (largest 31744 B), bus table 9572 B
+```
+
+如果要支持 7 口 HUB，把 `CONFIG_USBHOST_MAX_EHPORTS` 调到 7（多约 3 KB `.bss`），并接受内部 RAM 余量变小。
+
+### 验证结果（实机）
+
+```
+# 直插/经 HUB 的设备，开机就全部在线（busid = 物理端口路径）
+busid=1-1.1 1209:1301 speed=FS  class=ef/02/01 ifaces=3     # HUB 第 1 口，FS → 拆分事务
+busid=1-1.2 8312:8a02 speed=HS  class=00/00/00 ifaces=1
+busid=1-1.3 303a:1001 speed=FS  class=ef/02/01 ifaces=3
+busid=1-1.4 0bda:8153 speed=HS  class=00/00/00 ifaces=1
+
+# 用一个最小 usbip 客户端 import 1-1.1 后：
+control GET_DESCRIPTOR: status=0 len=18 head=12010002ef020140
+bulk OUT ep3: status=0
+# 未完成的 bulk IN 要么被 UNLINK（RET_UNLINK），要么端点 STALL（RET_SUBMIT -EPIPE=-32）
+
+# 旧写法 1-<addr> 已被拒绝
+import 1-6 -> op_common(version=0x0111, code=0x0003 OP_REP_IMPORT, status=0x4 ST_NODEV)
+```
+
+连续 5 次 `devlist` + 6 次「import → 控制传输 → bulk OUT → 未完成 bulk IN/UNLINK」，无 panic、无 WiFi 掉线。
+
+**busid 稳定性实测**：
+
+| 场景 | USB 地址 | busid | 结论 |
+| --- | --- | --- | --- |
+| 首次枚举 | FS 探针 addr=3 | `1-1.1` | — |
+| 该设备在原口拔出再插 | addr=6 | `1-1.1` | 不变 ✅ |
+| 整板复位（HUB 与设备都不动，全部重新枚举） | addr=8 | `1-1.1` / `1-1.2` / `1-1.4` | 全部不变 ✅ |
+| 另一个设备插到 HUB 第 3 口 | addr=7 | `1-1.3` | 按口命名 ✅ |
+
+### 设备表口径与面板列表（2026-10-28）
+
+早期「面板显示 3 个设备、列表只列出 2 个」的根因是**设备表索引口径不一致**：`slot_nth_locked()` 只按 `used` 过滤，而 `device_count()` / `get_snapshot_at()` 按 `used && alive` 过滤。adopt 之后、confirm 之前设备一旦被拔走，会留下一个 `used && !alive` 的残留槽，导致索引错位、`get_snapshot_at(i)` 返回 false 被 UI `continue` 掉一行（重插 HUB 必现）。
+
+修复：
+- `slot_nth_locked()` 统一为只枚举 `used && alive`，`addr_at` / `busid_at` / `get_snapshot_at` / usbip `devlist` 口径一致；
+- 断开钩子改为**按 `hport` 反查槽位**清（新增 `slot_by_hport_locked()`），并把指向该槽的 `s_pending_slot` 复位；adopt 前防御性回收陈旧槽；confirm 在 pending 失效时复位索引。
+- 面板侧：USBIP 应用把原来「`\n` 拼接的多行 label」换成**预创建 8 行 label + 可滚动容器**，行数与「N 个设备」来自同一次枚举，超过可视行数可滑动查看。
+
+### 已知限制
+
+- HUB 端口数默认 4（`CONFIG_USBHOST_MAX_EHPORTS`），且只支持一级外部 HUB（`CONFIG_USBHOST_MAX_EXTHUBS=1`）。
+- 端点查找只按 `altsetting[0]`；UVC 这类需要在运行中 `SET_INTERFACE` 切备用设置的设备，端点地址可能对不上（探针/串口/网卡不受影响）。
+- 同设备的控制传输串行执行（EP0 单 URB），并发控制请求会排队。
+- 本地 probe REPL 桥 / CDC 回环（`MKLINK_PROBE_ENABLE`）仍保持关闭，只保证编译通过。

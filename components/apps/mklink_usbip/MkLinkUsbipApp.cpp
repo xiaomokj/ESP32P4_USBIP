@@ -202,7 +202,7 @@ void MkLinkUsbipApp::buildUi(void)
     lv_obj_center(_svc_btn_label);
 
     _svc_status = make_label(svc, "服务未启动", FONT_CJK, COL_MUTED);
-    _svc_hint = make_label(svc, "启动后电脑执行: usbip attach -r <IP> -b 1-1",
+    _svc_hint = make_label(svc, "启动后电脑执行: usbip attach -r <IP> -b <busid>",
                            FONT_CJK, COL_DIM);
     lv_label_set_long_mode(_svc_hint, LV_LABEL_LONG_DOT);
     lv_obj_set_width(_svc_hint, LV_PCT(100));
@@ -320,14 +320,15 @@ void MkLinkUsbipApp::refresh(void)
         snprintf(buf, sizeof(buf), "运行中 · 端口 %u · 探针 %s",
                  (unsigned)mklink_usbip_port(), usb_ok ? "在线" : "未接入");
         set_text_if_changed(_svc_status, buf);
-        snprintf(buf, sizeof(buf), "电脑: usbip attach -r %s -b 1-1", ip);
+        snprintf(buf, sizeof(buf), "电脑: usbip attach -r %s -b %s", ip,
+                 (usb_ok && usb.busid[0]) ? usb.busid : "1-1");
         set_text_if_changed(_svc_hint, buf);
         set_text_color_if_changed(_svc_status, COL_OK);
         set_text_if_changed(_svc_btn_label, "停止服务");
         set_bg_color_if_changed(_svc_btn, COL_WARN);
     } else {
         set_text_if_changed(_svc_status, "服务未启动");
-        set_text_if_changed(_svc_hint, "启动后电脑执行: usbip attach -r <IP> -b 1-1");
+        set_text_if_changed(_svc_hint, "启动后电脑执行: usbip attach -r <IP> -b <busid>");
         set_text_color_if_changed(_svc_status, COL_MUTED);
         set_text_if_changed(_svc_btn_label, "启动服务");
         set_bg_color_if_changed(_svc_btn, COL_ACCENT);

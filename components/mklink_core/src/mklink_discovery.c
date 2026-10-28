@@ -433,7 +433,9 @@ static void start_task(uint8_t addr)
     s_running = true;
     unlock();
 
-    if (xTaskCreate(discovery_task, "mk_disc", 4096, (void *)(uintptr_t)addr, 5, NULL) != pdPASS) {
+    /* 6 KiB: the descriptor snapshot, the aligned DMA scratch buffers used by
+     * the CherryUSB control transfers and the log formatting all live here. */
+    if (xTaskCreate(discovery_task, "mk_disc", 6144, (void *)(uintptr_t)addr, 5, NULL) != pdPASS) {
         lock();
         s_running = false;
         unlock();

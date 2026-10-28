@@ -36,7 +36,6 @@
 #include "sys/select.h"
 #include "sys/time.h"
 
-#include "usb/usb_host.h"
 #include "usb/usb_types_ch9.h"
 
 #include "mklink_core.h"
@@ -54,6 +53,7 @@ static const char *TAG = "mklink.usbip";
 #define USBIP_VERSION           0x0111
 #define USBIP_BUS_ID_SIZE       32
 #define USBIP_DEV_PATH_SIZE     256
+#define USBIP_CFG_DESC_MAX      1024
 
 #define USBIP_CMD_SUBMIT        0x0001
 #define USBIP_CMD_UNLINK        0x0002
@@ -209,6 +209,9 @@ static int32_t esp_to_errno(esp_err_t e)
     case ESP_ERR_NO_MEM:      return -ENOMEM;
     case ESP_ERR_INVALID_ARG: return -EINVAL;
     case ESP_ERR_INVALID_SIZE:return -EINVAL;
+    /* A stalled pipe must reach the client as -EPIPE: usbip-win2 and the Linux
+     * vhci driver use it to retry/relax control requests. */
+    case ESP_ERR_NOT_SUPPORTED:return -EPIPE;
     default:                  return -EIO;
     }
 }
@@ -255,19 +258,13 @@ static int send_op_common(int s, uint16_t code, uint32_t status)
 
 /* ------------------------------------------------------- device snapshot -- */
 
-static uint8_t esp_speed_to_usbip(usb_speed_t speed)
-{
-    switch (speed) {
-    case USB_SPEED_LOW:  return USBIP_SPEED_LOW;
-    case USB_SPEED_FULL: return USBIP_SPEED_FULL;
-    case USB_SPEED_HIGH: return USBIP_SPEED_HIGH;
-    default:             return USBIP_SPEED_UNKNOWN;
-    }
-}
-
 /**
  * Fill @p udev and copy the raw device (18 bytes) and config (wTotalLength)
  * descriptors of the active device. Returns 0 on success.
+ *
+ * The descriptors come from the per-slot cache built at enumeration time: the
+ * device is already live and exported, so no control transfer is issued here
+ * (that would interleave with the URBs of an attached client).
  */
 static int collect_device(uint8_t dev_addr,
                           usbip_usb_device_t *udev,
@@ -281,49 +278,58 @@ static int collect_device(uint8_t dev_addr,
         return -1;
     }
 
-    usb_device_handle_t hdl = NULL;
-    if (!mklink_usb_handle_for_addr(addr, &hdl)) {
+    usb_device_desc_t dd;
+    if (mklink_usb_device_desc(addr, &dd) != ESP_OK) {
         return -1;
     }
 
-    const usb_device_desc_t *dd = NULL;
-    const usb_config_desc_t *cd = NULL;
-    if (usb_host_get_device_descriptor(hdl, &dd) != ESP_OK || dd == NULL) {
+    uint8_t *cfg = malloc(USBIP_CFG_DESC_MAX);
+    if (cfg == NULL) {
         return -1;
     }
-    if (usb_host_get_active_config_descriptor(hdl, &cd) != ESP_OK || cd == NULL) {
+    size_t cfg_len = 0;
+    if (mklink_usb_config_desc(addr, cfg, USBIP_CFG_DESC_MAX, &cfg_len) != ESP_OK || cfg_len < 9) {
+        free(cfg);
         return -1;
     }
 
-    usb_device_info_t info;
-    memset(&info, 0, sizeof(info));
-    usb_host_device_info(hdl, &info);
+    const usb_config_desc_t *cd = (const usb_config_desc_t *)cfg;
+    uint8_t speed = USBIP_SPEED_UNKNOWN;
+    (void)mklink_usb_device_speed(addr, &speed);
+
+    /* Stable id: the physical port path ("1-1", "1-1.2"), not the dynamic USB
+     * address - the client must be able to keep using the same -b value after a
+     * re-plug on the same port. */
+    char busid[USBIP_BUS_ID_SIZE];
+    if (mklink_usb_busid_for_addr(addr, busid, sizeof(busid)) <= 0) {
+        free(cfg);
+        return -1;
+    }
 
     memset(udev, 0, sizeof(*udev));
-    snprintf(udev->path, sizeof(udev->path),
-             "/sys/devices/platform/mklink/1-%u", (unsigned)addr);
-    snprintf(udev->busid, sizeof(udev->busid), "1-%u", (unsigned)addr);
+    snprintf(udev->path, sizeof(udev->path), "/sys/devices/platform/mklink/%s", busid);
+    strlcpy(udev->busid, busid, sizeof(udev->busid));
     udev->busnum = 1;
     udev->devnum = addr;
-    udev->speed  = esp_speed_to_usbip(info.speed);
-    udev->idVendor  = dd->idVendor;
-    udev->idProduct = dd->idProduct;
-    udev->bcdDevice = dd->bcdDevice;
-    udev->bDeviceClass    = dd->bDeviceClass;
-    udev->bDeviceSubClass = dd->bDeviceSubClass;
-    udev->bDeviceProtocol = dd->bDeviceProtocol;
+    udev->speed  = speed;
+    udev->idVendor  = dd.idVendor;
+    udev->idProduct = dd.idProduct;
+    udev->bcdDevice = dd.bcdDevice;
+    udev->bDeviceClass    = dd.bDeviceClass;
+    udev->bDeviceSubClass = dd.bDeviceSubClass;
+    udev->bDeviceProtocol = dd.bDeviceProtocol;
     udev->bConfigurationValue = cd->bConfigurationValue;
-    udev->bNumConfigurations  = dd->bNumConfigurations;
+    udev->bNumConfigurations  = dd.bNumConfigurations;
     udev->bNumInterfaces      = cd->bNumInterfaces;
 
     if (dev_desc != NULL && dev_desc_cap >= 18) {
-        memcpy(dev_desc, dd, 18);
+        memcpy(dev_desc, &dd, 18);
     }
 
     /* Walk the config descriptor to collect interface class/subclass/protocol. */
     int uinf_n = 0;
-    const uint8_t *p = (const uint8_t *)cd;
-    const uint8_t *end = p + cd->wTotalLength;
+    const uint8_t *p = cfg;
+    const uint8_t *end = cfg + (cfg_len < cd->wTotalLength ? cfg_len : cd->wTotalLength);
     while (p + 2 <= end) {
         uint8_t dlen = p[0];
         uint8_t dtype = p[1];
@@ -342,18 +348,27 @@ static int collect_device(uint8_t dev_addr,
     if (uinf_count != NULL) {
         *uinf_count = uinf_n;
     }
+    if (uinf_n == 0) {
+        ESP_LOGW(TAG, "addr %u: no interface in cfg (len %u, wTotalLength %u) %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+                 (unsigned)addr, (unsigned)cfg_len, (unsigned)cd->wTotalLength,
+                 cfg[0], cfg[1], cfg[2], cfg[3], cfg[4], cfg[5], cfg[6], cfg[7], cfg[8], cfg[9]);
+    }
 
     if (conf_desc != NULL && conf_desc_cap > 0) {
         size_t len = cd->wTotalLength;
+        if (len > cfg_len) {
+            len = cfg_len;
+        }
         if (len > conf_desc_cap) {
             len = conf_desc_cap;
         }
-        memcpy(conf_desc, cd, len);
+        memcpy(conf_desc, cfg, len);
         if (conf_len_out != NULL) {
             *conf_len_out = len;
         }
     }
 
+    free(cfg);
     return 0;
 }
 
@@ -375,7 +390,7 @@ static int send_devlist_reply(int s)
         return -1;
     }
 
-    /* Every adopted device is exported on its own busid ("1-<addr>"). */
+    /* Every adopted device is exported on its own busid ("1-<port path>"). */
     int total = mklink_usb_device_count();
     uint32_t ndev = be32((uint32_t)total);
     if (send_all(s, &ndev, sizeof(ndev)) != 0) {
@@ -404,7 +419,7 @@ static int send_devlist_reply(int s)
     return 0;
 }
 
-/** Resolve the busid the client asked for ("1-<addr>") to a device address. */
+/** Resolve the busid the client asked for ("1-1", "1-1.2", ...) to an address. */
 static uint8_t find_device_by_busid(const char *busid)
 {
     int total = mklink_usb_device_count();
@@ -414,7 +429,9 @@ static uint8_t find_device_by_busid(const char *busid)
             continue;
         }
         char b[USBIP_BUS_ID_SIZE];
-        snprintf(b, sizeof(b), "1-%u", (unsigned)addr);
+        if (mklink_usb_busid_for_addr(addr, b, sizeof(b)) <= 0) {
+            continue;
+        }
         if (strcmp(b, busid) == 0) {
             return addr;
         }
@@ -746,6 +763,13 @@ static void client_task(void *arg)
     int one = 1;
     setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 
+    /* WiFi clients disappear without a FIN (sleep, channel switch, reboot). The
+     * per-connection task must not pin its 8 KiB stack and sockets forever, so
+     * probe the peer and bound every blocking read. */
+    setsockopt(s, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
+    struct timeval rcv_tmo = { .tv_sec = 120, .tv_usec = 0 };
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &rcv_tmo, sizeof(rcv_tmo));
+
     /* ---- control phase ---- */
     for (;;) {
         op_common_t common;
@@ -797,7 +821,11 @@ static void client_task(void *arg)
         (void)mklink_usb_claim_interface(cs.dev_addr, (uint8_t)i);
     }
     imported = true;
-    mklink_log("USBIP: client imported 1-%u, forwarding URBs", (unsigned)cs.dev_addr);
+    char busid[USBIP_BUS_ID_SIZE];
+    if (mklink_usb_busid_for_addr(cs.dev_addr, busid, sizeof(busid)) <= 0) {
+        strlcpy(busid, "?", sizeof(busid));
+    }
+    mklink_log("USBIP: client imported %s, forwarding URBs", busid);
 
     /* ---- data plane ---- */
     for (;;) {

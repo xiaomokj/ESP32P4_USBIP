@@ -3,12 +3,15 @@
  *
  * Layout: header / two status cards (USB device + network) / usbip service
  * panel / log panel / action row. Any USB device plugged into the host port is
- * exported; the PC runs `usbip attach -r <IP> -b 1-1` and sees it natively.
+ * exported; the PC runs `usbip attach -r <IP> -b 1-1` (busid = physical port
+ * path, so it survives a re-plug on the same port) and sees it natively.
  *
  * SPDX-License-Identifier: Apache-2.0
  */
 #include <stdio.h>
 #include <string.h>
+
+#include "esp_log.h"
 
 #include "UsbipApp.hpp"
 #include "mklink_usbip/MkLinkUi.hpp"
@@ -19,6 +22,8 @@
 
 LV_IMG_DECLARE(img_app_usbip);
 LV_FONT_DECLARE(mklink_font_cjk_16);
+
+static const char *TAG = "UsbipApp";
 
 #define COL_BG        lv_color_hex(0x0B0F14)
 #define COL_CARD      lv_color_hex(0x121821)
@@ -135,9 +140,37 @@ void UsbipApp::buildUi(void)
     lv_label_set_long_mode(_usb_name, LV_LABEL_LONG_DOT);
     lv_obj_set_width(_usb_name, LV_PCT(100));
     _usb_id = make_label(usb_card, "-- : --", FONT_META, COL_ACCENT);
-    _usb_meta = make_label(usb_card, "插入任意 USB 设备后自动识别", FONT_CJK, COL_DIM);
-    lv_label_set_long_mode(_usb_meta, LV_LABEL_LONG_DOT);
-    lv_obj_set_width(_usb_meta, LV_PCT(100));
+
+    /*
+     * Device list: one row per device inside a scrollable container. It has to
+     * be its own object (not one multi-line label) so that a row can never be
+     * clipped by the card and so that more rows than fit stay reachable by
+     * scrolling. Rows are created once here and only re-texted on refresh.
+     */
+    _usb_list = lv_obj_create(usb_card);
+    lv_obj_set_width(_usb_list, LV_PCT(100));
+    lv_obj_set_flex_grow(_usb_list, 1);
+    lv_obj_set_style_bg_opa(_usb_list, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(_usb_list, 0, 0);
+    lv_obj_set_style_radius(_usb_list, 0, 0);
+    lv_obj_set_style_pad_all(_usb_list, 0, 0);
+    lv_obj_set_style_pad_row(_usb_list, 2, 0);
+    lv_obj_set_flex_flow(_usb_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_add_flag(_usb_list, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(_usb_list, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(_usb_list, LV_SCROLLBAR_MODE_AUTO);
+
+    for (int i = 0; i < MKLINK_USB_MAX_DEVICES; i++) {
+        lv_obj_t *row = make_label(_usb_list, "", FONT_CJK, COL_MUTED);
+        lv_label_set_long_mode(row, LV_LABEL_LONG_DOT);
+        lv_obj_set_width(row, LV_PCT(100));
+        lv_obj_add_flag(row, LV_OBJ_FLAG_HIDDEN);
+        _usb_rows[i] = row;
+    }
+
+    _usb_hint = make_label(_usb_list, "插入任意 USB 设备后自动识别", FONT_CJK, COL_DIM);
+    lv_label_set_long_mode(_usb_hint, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(_usb_hint, LV_PCT(100));
 
     lv_obj_t *net_card = make_card(cards, "网络地址", &_net_dot);
     _net_line = make_label(net_card, "等待联网", FONT_CJK, COL_TEXT);
@@ -236,43 +269,67 @@ void UsbipApp::buildUi(void)
 
 void UsbipApp::refresh(void)
 {
-    if (_usb_name == NULL) {
+    if (_usb_name == NULL || _usb_list == NULL) {
         return;
     }
 
     char buf[96];
 
-    /* ---- USB device(s): every adopted device gets its own busid ---- */
-    int dev_cnt = mklink_usb_device_count();
-    bool usb_ok = (dev_cnt > 0);
-    set_bg_color_if_changed(_usb_dot, usb_ok ? COL_OK : COL_DIM);
-    if (usb_ok) {
-        mklink_usb_snapshot_t first;
-        mklink_usb_get_snapshot_at(0, &first);
+    /*
+     * ---- USB device(s): every adopted device gets its own row ----
+     *
+     * Enumerate once and derive *everything* (row count, "N 个设备", VID:PID)
+     * from that single result. Asking mklink_usb_device_count() separately used
+     * to disagree with the index based snapshot lookup and made the panel claim
+     * "3 devices" while rendering only 2.
+     */
+    mklink_usb_snapshot_t snaps[MKLINK_USB_MAX_DEVICES];
+    int dev_cnt = 0;
+    memset(snaps, 0, sizeof(snaps));
+    while (dev_cnt < MKLINK_USB_MAX_DEVICES && mklink_usb_get_snapshot_at(dev_cnt, &snaps[dev_cnt])) {
+        dev_cnt++;
+    }
+    if (dev_cnt != mklink_usb_device_count()) {
+        ESP_LOGW(TAG, "device table mismatch: rows=%d count=%d", dev_cnt, mklink_usb_device_count());
+    }
 
+    for (int i = 0; i < MKLINK_USB_MAX_DEVICES; i++) {
+        if (i < dev_cnt) {
+            char line[64];
+            snprintf(line, sizeof(line), "%-6s %s",
+                     snaps[i].busid[0] ? snaps[i].busid : "1-?",
+                     snaps[i].product[0] ? snaps[i].product : "USB device");
+            set_text_if_changed(_usb_rows[i], line);
+            lv_obj_clear_flag(_usb_rows[i], LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(_usb_rows[i], LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    if (_usb_rows_used != dev_cnt) {
+        /* Bring the scroll position back to the top when the set changed. */
+        if (_usb_list != nullptr) {
+            lv_obj_scroll_to_y(_usb_list, 0, LV_ANIM_OFF);
+        }
+        _usb_rows_used = dev_cnt;
+    }
+
+    bool usb_ok = (dev_cnt > 0);
+    if (usb_ok) {
         snprintf(buf, sizeof(buf), "%d 个设备", dev_cnt);
         set_text_if_changed(_usb_name, buf);
-        snprintf(buf, sizeof(buf), "%04X : %04X", first.vid, first.pid);
+        snprintf(buf, sizeof(buf), "%04X : %04X", snaps[0].vid, snaps[0].pid);
         set_text_if_changed(_usb_id, buf);
-
-        char list[224] = {0};
-        for (int i = 0; i < dev_cnt && i < 4; i++) {
-            mklink_usb_snapshot_t s;
-            if (!mklink_usb_get_snapshot_at(i, &s)) {
-                continue;
-            }
-            char line[72];
-            snprintf(line, sizeof(line), "%s1-%u  %s", (i > 0) ? "\n" : "",
-                     (unsigned)s.dev_addr, s.product[0] ? s.product : "USB device");
-            strncat(list, line, sizeof(list) - strlen(list) - 1);
-        }
-        set_text_if_changed(_usb_meta, list);
         set_text_color_if_changed(_usb_id, COL_ACCENT);
+        if (_usb_hint != nullptr) {
+            lv_obj_add_flag(_usb_hint, LV_OBJ_FLAG_HIDDEN);
+        }
     } else {
         set_text_if_changed(_usb_name, "未连接");
         set_text_if_changed(_usb_id, "-- : --");
-        set_text_if_changed(_usb_meta, "插入任意 USB 设备后自动识别");
         set_text_color_if_changed(_usb_id, COL_DIM);
+        if (_usb_hint != nullptr) {
+            lv_obj_clear_flag(_usb_hint, LV_OBJ_FLAG_HIDDEN);
+        }
     }
 
     /* ---- network ---- */
@@ -315,8 +372,8 @@ void UsbipApp::refresh(void)
                  (unsigned)mklink_usbip_port(), dev_cnt);
         set_text_if_changed(_svc_status, buf);
         if (ip != NULL && dev_cnt > 0) {
-            snprintf(buf, sizeof(buf), "电脑: usbip attach -r %s -b 1-%u", ip,
-                     (unsigned)mklink_usb_addr_at(0));
+            snprintf(buf, sizeof(buf), "电脑: usbip attach -r %s -b %s", ip,
+                     snaps[0].busid[0] ? snaps[0].busid : "1-?");
         } else if (ip != NULL) {
             snprintf(buf, sizeof(buf), "电脑: usbip attach -r %s -b 1-<n>", ip);
         } else {
@@ -369,6 +426,12 @@ bool UsbipApp::close(void)
 {
     _timer = nullptr;
     _usb_name = nullptr;
+    _usb_list = nullptr;
+    _usb_hint = nullptr;
+    _usb_rows_used = -1;
+    for (int i = 0; i < MKLINK_USB_MAX_DEVICES; i++) {
+        _usb_rows[i] = nullptr;
+    }
     _net_line = nullptr;
     _log_label = nullptr;
     _svc_btn = nullptr;

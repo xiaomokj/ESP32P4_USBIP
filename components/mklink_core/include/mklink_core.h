@@ -40,10 +40,11 @@ typedef struct {
     bool     connected;
     uint16_t vid;
     uint16_t pid;
-    uint8_t  dev_addr;
+    uint8_t  dev_addr;   /* dynamic USB address, not stable across re-enumeration */
     uint8_t  iface_cnt;
     uint8_t  ep_cnt;
     uint8_t  cdc_iface;  /* 0xFF when the device has no CDC interface */
+    char     busid[20];  /* stable usbip id built from the physical port path: "1-1.2" */
     char     manufacturer[MKLINK_USB_STRING_LEN];
     char     product[MKLINK_USB_PRODUCT_LEN];
 } mklink_usb_snapshot_t;

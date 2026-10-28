@@ -12,6 +12,8 @@
 #include "lvgl.h"
 #include "esp_brookesia.hpp"
 
+#include "mklink_usb.h"     /* MKLINK_USB_MAX_DEVICES sizes the row pool */
+
 class UsbipApp : public ESP_Brookesia_PhoneApp {
 public:
     UsbipApp();
@@ -37,7 +39,10 @@ private:
     lv_obj_t *_usb_dot = nullptr;
     lv_obj_t *_usb_name = nullptr;
     lv_obj_t *_usb_id = nullptr;
-    lv_obj_t *_usb_meta = nullptr;
+    lv_obj_t *_usb_list = nullptr;                            /* scrollable row container */
+    lv_obj_t *_usb_rows[MKLINK_USB_MAX_DEVICES] = {};         /* one label per device */
+    lv_obj_t *_usb_hint = nullptr;                            /* shown when no device */
+    int _usb_rows_used = -1;
 
     /* ---- network card ---- */
     lv_obj_t *_net_dot = nullptr;

@@ -10,5 +10,5 @@ idf_component_register(
     INCLUDE_DIRS "include"
     PRIV_INCLUDE_DIRS "src"
     REQUIRES usb
-    PRIV_REQUIRES esp_wifi esp_netif esp_event nvs_flash esp_timer lwip json driver
+    PRIV_REQUIRES cherryusb esp_wifi esp_netif esp_event nvs_flash esp_timer lwip json driver
 )

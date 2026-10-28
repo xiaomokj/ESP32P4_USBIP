@@ -28,7 +28,7 @@
 
 - 板子只有一路 P4 USB PHY，当前固件用作 **Host**，所以烧录/日志走 **UART 桥（CH343，`/dev/ttyACM0`）**。
 - BSP 注释明确本板**没有 VBUS 使能控制**。设备（尤其探针）不上电时需要 **USB-C 转 A 母的 OTG 线 + 外部供电**，或接**有源 HUB**。
-- USB Host 控制传输上限已提到 1024 字节（`CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE`），usbip 转发完整配置描述符必需。
+- 主机栈是 **CherryUSB**（`components/cherryusb`），配置上限在 `osal/idf/usb_config.h`：接口 8 / 每接口端点 6 / 一级 HUB 4 个下游端口。增大这些值会直接吃内部 RAM，而 esp_hosted 的 WiFi TX 缓冲也来自内部 RAM，改之前请先看开机那行 `USB: internal heap ...` 余量。
 
 ### C6 从机固件（必须与 host 侧 esp_hosted 同版本）
 
@@ -121,10 +121,20 @@ IDF 5.5.5 的 bootloader 大于 0x6000 字节，无法放在 `0x8000`，因此�
 
 ```powershell
 cd "C:\Program Files\USBip"
-.\usbip.exe list -r <ESP32-IP>            # 应列出你的设备（busid 固定 1-1）
-.\usbip.exe attach -r <ESP32-IP> -b 1-1   # 挂接
+.\usbip.exe list -r <ESP32-IP>            # 列出设备与 busid
+.\usbip.exe attach -r <ESP32-IP> -b 1-1   # 挂接（busid 用 list 里的值）
 .\usbip.exe detach -p 1                   # 用完断开（端口号看 attach 输出）
 ```
+
+**busid 规则**：`1-<物理端口路径>`，与 USB 地址无关，所以**同一个口重插后 `-b` 的值不变**：
+
+| 物理位置 | busid |
+| --- | --- |
+| 直插板载 USB Host 口 | `1-1` |
+| 高速 HUB 的第 2 个下游口 | `1-1.2` |
+| 高速 HUB 的第 4 个下游口 | `1-1.4` |
+
+（HUB 本身不导出；把设备换到另一个口，busid 会随之变化。）
 
 attach 成功后设备会出现在设备管理器，可正常使用（Keil 里 Debug 选 CMSIS-DAP 即调试）。
 
@@ -133,7 +143,7 @@ Linux 端则用内核自带客户端：
 ```bash
 sudo modprobe vhci-hcd
 sudo usbip list -r <ESP32-IP>
-sudo usbip attach -r <ESP32-IP> -b 1-1
+sudo usbip attach -r <ESP32-IP> -b 1-1.2   # 用 list 里显示的 busid
 ```
 
 ### 3.3 配置项
@@ -160,7 +170,7 @@ sudo usbip attach -r <ESP32-IP> -b 1-1
 MKLINK_REMOTE/
 ├── CMakeLists.txt                 # project(esp32p4_usbip)
 ├── partitions.csv                 # 分区表偏移 0x9000 / nvs 0xa000
-├── sdkconfig.defaults             # P4 v1.x、hosted SDIO 引脚、USB 1024、CJK 字体、串口 921600、usbip 开关
+├── sdkconfig.defaults             # P4 v1.x、hosted SDIO 引脚、CJK 字体、串口 921600、usbip 开关
 ├── README.md
 ├── tools/
 │   ├── build.sh                   # 构建/烧录封装（flash 2 Mbps / monitor 921600）
@@ -180,6 +190,9 @@ MKLINK_REMOTE/
 │   │   └── usbip/                 # USBIP 通用应用
 │   │       ├── UsbipApp.{hpp,cpp}
 │   │       └── assets/img_app_usbip.c
+│   ├── cherryusb/                 # USB 主机栈（vendor 自 CherryUSB 1.5.2，精简+补丁，见 USBIP_PORTING.md 第七节）
+│   │   ├── core/ class/hub/ common/ osal/idf/ port/dwc2/
+│   │   └── CMakeLists.txt
 │   └── mklink_core/               # 支撑组件
 │       ├── include/{mklink_core,mklink_wifi,mklink_usb,mklink_usb_raw,mklink_usbip}.h
 │       └── src/{mklink_core,mklink_wifi,mklink_usb,mklink_usb_raw,mklink_cdc,mklink_net,mklink_usbip}.c
@@ -189,11 +202,13 @@ MKLINK_REMOTE/
 关键设计：
 
 - **WiFi 单一所有者**：`mklink_core` 建立 `APSTA`，设置应用只做 UI 与监听，连接/断开/凭据全部走 `mklink_wifi_*`。
-- **USB 不抢占接口**：枚举只缓存描述符与端点表；usbip 导入时才独占设备（停探针 REPL → claim 实际存在的接口），断开时释放。
+- **USB 主机栈是 CherryUSB，不是 IDF usb_host**：IDF 5.5 的主机栈没有 HUB 的 TT/拆分事务，高速 HUB 下游的 FS/LS 设备（键鼠、CH340、FS 版 DAPLink）永远枚举不出来。CherryUSB 的 dwc2 端口实现了 SSPLIT/CSPLIT，`components/cherryusb` 里只保留主机核心 + hub class + dwc2 端口，并加了插拔弱钩子和「开机扫描 HUB 下游端口」等补丁。
+- **USB 不抢占接口**：CherryUSB 只做枚举与 URB 收发，不编译任何 class driver（除 hub），设备保持"裸挂"；usbip 导入时直接对该设备的端点发 URB，断开时取消在途请求。
 - **UI 只读快照**：状态经 `MKLINK_EVENT` 与快照 getter，LVGL 由 200 ms 定时器在 LVGL 任务内刷新，不在其它任务碰 `lv_*`。
 - **SDIO 传输缓冲用堆分配**（`CONFIG_ESP_HOSTED_USE_MEMPOOL=n`）：开着 mempool 时 WiFi 一旦真正收发数据，P4 会在 1~8 秒内报 `Unrecoverable host sdio state` 并重启；关掉后 40 MHz / 4-bit 连续跑 90 秒以上无异常。
 - **中文用项目自带子集字体**：`mklink_usbip/assets/mklink_font_cjk_16.c`（Noto Sans CJK SC，16 px / 4 bpp）。改中文文案后用 `python3 tools/gen_font.py` 重新生成。
 - **应用图标规范**：112×112 满版圆角底板 + glyph；`LV_COLOR_DEPTH=16` 时 `LV_IMG_CF_TRUE_COLOR_ALPHA` 是**逐像素交错** `[RGB565 低][RGB565 高][A]`（3 B/px），不是颜色平面 + alpha 平面——写成平面版能编译但上屏乱码。
+- **busid = 物理端口路径**：`1-<根端口>[.<HUB端口>...]`（如 `1-1`、`1-1.2`），由 CherryUSB 拓扑（`hubport.port` / `hub.parent`）在 adopt 时算一次并缓存。**不能用 CherryUSB 的动态 USB 地址**，否则 HUB/设备重插后 PC 端的 `-b` 值就变了。
 - **usbip 线协议**：48 字节头、`op_common`、`usbip_usb_device` 312 字节、OP 编码 0x8005/0x8003，均按 Linux 内核源码逐字节对齐；服务端设置 `TCP_NODELAY`，数据面用 5 ms `select` 轮询以免回包延迟导致客户端超时。
 
 ---
@@ -207,10 +222,17 @@ MKLINK_REMOTE/
 - 40 MHz SDIO 连续运行 90 s 无异常。
 - USB Host 枚举到探针 `0D28:0202 "MicroKeenV4 CMSIS-DAP"`（8 接口 / 13 端点 / 3 组 CDC）。
 - usbip：`list` 正确列出设备与 8 个接口；`attach` 在 **usbip-win2** 上成功（`successfully attached to port 1`），设备在 Windows 中作为 CMSIS-DAP 出现。
+- **高速 HUB 下游的 FS 设备**（`1209:1301 "BAT CMSIS-DAP"`，`speed=FS`）与 HS 设备同时在线；`devlist` / `import` / 控制传输 / bulk OUT / 未完成 bulk IN + UNLINK 全部通过（连续 6 轮无 panic、WiFi 不掉线）。
+- 板子复位而 HUB 仍供电时，已在 HUB 上的设备开机即被枚举（CherryUSB 补丁：hub 初始化后扫描端口）。
+- busid 稳定：同一物理口（含 HUB 下游口）重插后 busid 不变，`usbip attach -b` 可继续沿用；devlist 里 USB 地址会变但 busid 不变。
+- USBIP 面板的设备列表：**每设备一行 + 区域可滚动**，行数与「N 个设备」来自同一次枚举，重插 HUB 后不再出现「显示 3 个只列出 2 个」。
 
 已知限制：
 
-- 单客户端、单设备（busid 固定 `1-1`，只导出当前枚举到的那一个设备）。
+- busid 形如 `1-1.2`，可同时导出 HUB 下游多个设备；但每条 TCP 连接只服务一次 import（attach 失败后需重新连）。
 - Windows 端 usbip 客户端驱动未签名，需关闭 Secure Boot。
 - bulk IN 超时较长（60 s），CMSIS-DAP 长耗时响应会超时重传，调试场景基本够用。
+- HUB 支持一级、默认最多 4 个下游端口（`components/cherryusb/osal/idf/usb_config.h` 的 `CONFIG_USBHOST_MAX_EHPORTS`，加大要吃内部 RAM）。
+- 端点按 `altsetting[0]` 查找，运行中 `SET_INTERFACE` 切备用设置的设备（如 UVC）可能对不上端点。
+- 本地 probe REPL 桥 / CDC 回环（`MKLINK_PROBE_ENABLE` / `MKLINK_CDC_TEST_ENABLE`）在 CherryUSB 下只保证编译通过，未实测。
 - 老 `cezanne/usbip-win` 0.3.6-dev 对本工程复合设备不可用，请用 usbip-win2。

@@ -16,6 +16,13 @@
 extern "C" {
 #endif
 
+/**
+ * @brief Size of the device table (also the upper bound for the index APIs).
+ *
+ * Shared with the UI so panels can pre-create one row per possible device.
+ */
+#define MKLINK_USB_MAX_DEVICES 8
+
 /** Install the USB host stack, register a persistent client and enumerate. */
 esp_err_t mklink_usb_start(void);
 
@@ -30,6 +37,15 @@ int mklink_usb_device_count(void);
 
 /** USB address of the @p idx-th device; 0xFF when @p idx is out of range. */
 uint8_t mklink_usb_addr_at(int idx);
+
+/**
+ * @brief Stable usbip busid of the @p idx-th device ("1-1", "1-1.2", ...).
+ *
+ * Built from the physical port path, so it survives a re-plug on the same port
+ * (unlike the dynamic USB address). @return Number of bytes written, 0 when
+ * @p idx is out of range.
+ */
+int mklink_usb_busid_at(int idx, char *buf, size_t len);
 
 /** Snapshot of the @p idx-th device (false when out of range / not alive). */
 bool mklink_usb_get_snapshot_at(int idx, mklink_usb_snapshot_t *out);
