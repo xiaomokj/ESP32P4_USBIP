@@ -39,6 +39,7 @@ typedef struct {
     uint8_t addr;
     usb_device_handle_t hdl;         /* owned by this struct until adopted/released */
     uint16_t vid, pid;
+    uint8_t dev_class;               /* bDeviceClass (0x09 = HUB, skipped) */
     uint8_t iface_cnt;
     uint8_t ep_count;
     uint8_t cdc_count;
@@ -63,10 +64,19 @@ esp_err_t mklink_usb_adopt(mklink_usb_desc_t *desc);
 void mklink_usb_confirm_adopted(void);
 void mklink_usb_discard_adopted(void);
 
-/** @return true when a device is already active. */
+/** @return true when no further device can be adopted (table full). */
 bool mklink_usb_busy(void);
 
-/** CDC groups of the active device (used by the probe bridge). */
+/** Number of enumerated/adopted devices. */
+int mklink_usb_device_count(void);
+/** Address of the @p idx-th adopted device (MKLINK_USB_ADDR_NONE if out of range). */
+uint8_t mklink_usb_addr_at(int idx);
+/** Snapshot of the @p idx-th adopted device. */
+bool mklink_usb_get_snapshot_at(int idx, mklink_usb_snapshot_t *out);
+/** Snapshot of the device with @p dev_addr. */
+bool mklink_usb_snapshot_for_addr(uint8_t dev_addr, mklink_usb_snapshot_t *out);
+
+/** CDC groups of the first adopted device (used by the probe bridge). */
 int mklink_usb_cdc_group_list(mklink_cdc_group_t *out, size_t max);
 
 /** Fill @p addrs with the currently attached device addresses. */
@@ -98,9 +108,9 @@ esp_err_t mklink_wifi_early_init(void);
 usb_host_client_handle_t mklink_usb_client_handle(void);
 bool mklink_usb_handle_for_addr(uint8_t dev_addr, usb_device_handle_t *out);
 uint8_t mklink_usb_current_addr(void);
-esp_err_t mklink_usb_claim_interface(uint8_t iface_num);
-esp_err_t mklink_usb_release_interface(uint8_t iface_num);
-int mklink_usb_endpoint_list(mklink_ep_info_t *out, size_t max);
+esp_err_t mklink_usb_claim_interface(uint8_t dev_addr, uint8_t iface_num);
+esp_err_t mklink_usb_release_interface(uint8_t dev_addr, uint8_t iface_num);
+int mklink_usb_endpoint_list(uint8_t dev_addr, mklink_ep_info_t *out, size_t max);
 
 /** @return true when a CDC data interface was found; @p comm / @p data are 0xFF if absent. */
 bool mklink_usb_cdc_ifaces(uint8_t *comm, uint8_t *data);

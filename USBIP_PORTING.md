@@ -198,6 +198,71 @@ pnputil /add-driver .\usbip_vhci_ude.inf /install
 
 **解决**：用 **USB-C 转 A 母 OTG 线 + 外部供电**，或接**有源 HUB**。设备枚举成功后日志会出现 `USB: VID:PID "name"`。
 
+### 坑 14.1：USB HUB 默认不被支持 ⭐
+
+**现象**：接上 USB-HUB / 扩展坞后，串口只有：
+
+```
+W HUB: External Hubs support disabled, Hub device was not initialized
+```
+
+HUB 后面的设备**完全枚举不到**，`usbip list` 是空的。
+
+**原因**：ESP-IDF `usb_host` 的 `CONFIG_USB_HOST_HUBS_SUPPORTED` **默认是 `n`**。主机栈能识别到 HUB（会打印它的 VID:PID），但不会初始化它，因此永远不会去枚举它下游的设备。
+
+**解决**：
+
+```
+CONFIG_USB_HOST_HUBS_SUPPORTED=y
+CONFIG_USB_HOST_HUB_MULTI_LEVEL=y      # 允许多级 HUB 串联
+```
+
+开启后日志里 HUB 会被正常初始化，下游设备各自产生 `NEW_DEV` 事件。
+
+> 附带注意：HUB 本身也是一个 USB 设备（`bDeviceClass = 0x09`），必须显式跳过，否则它会被当成待导出设备。判断方式：`bDeviceClass == 0x09` 或任一接口类是 `0x09`。
+
+### 坑 14.2：只导出 CDC 设备是不够的
+
+**现象**：HUB 支持开了、设备枚举到了，但 `usbip list` 还是空。
+
+**原因**：探针发现逻辑（`discovery_pass`）最初只采纳「带 CDC 且通过 REPL 身份校验」的设备，U 盘 / HID / 网卡等非 CDC 设备被直接拒绝。
+
+**解决**：通用网关模式下放宽采纳条件——**非 HUB、且通过 VID/PID 过滤的设备一律采纳**；CDC 设备即使探针校验失败也保留（不再 discard）。
+
+### 坑 14.3：全速/低速设备挂在高速 HUB 下必然失败（TT 未实现）⭐
+
+**现象**：HUB 支持开了之后，HS 设备（U 盘、千兆网卡、CMSIS-DAP 探针）都能枚举，但**键鼠、CH340 串口、Saleae 逻辑分析仪、多数调试器**等全速设备完全不出现：
+
+```
+E HUB: Connected device is FS, transaction translator (TT) is not supported
+E EXT_PORT: [1:2] Port disabled, reset attempts=1
+W HUB: Device tree node (parent_port=2): not found
+```
+
+**原因**：USB 2.0 高速 HUB 下游接 Full-Speed / Low-Speed 设备时，必须由 HUB 的 **TT（Transaction Translator）** 做 HS↔FS 速度转换。ESP-IDF 的 `components/usb/hub.c` 里是**硬编码判断 + 直接禁用端口**：
+
+```c
+if (parent_dev_info.speed == USB_SPEED_HIGH) {
+    if (port_speed != parent_dev_info.speed) {
+        ESP_LOGE(HUB_DRIVER_TAG, "Connected device is %s, transaction translator (TT) is not supported", ...);
+        goto new_ds_dev_err;
+    }
+}
+```
+
+**没有任何 Kconfig 可以打开**（`USB_HOST_HUBS_SUPPORTED` 只管 HUB 本身，不管 TT）。截至 IDF 5.5.x 仍未实现 TT 调度。
+
+**解决 / 规避**：
+
+| 方案 | 说明 |
+| --- | --- |
+| **FS 设备直连 ESP32** | 不经 HUB，单设备完全正常（推荐） |
+| **用 USB 1.1 全速 HUB** | HUB 自身以 FS 枚举时该检查被跳过，FS 设备可用；代价是 HS 设备被降速到 12 Mbps |
+| **混合拓扑** | HS 设备走现有高速 HUB，FS/LS 设备（键鼠、串口、音频、逻辑分析仪）直连 |
+| 改 IDF 源码实现 TT | 工作量大（需实现 TT 调度/分裂事务），不建议 |
+
+> 判断设备速度：串口日志 `USB: ... addr=N` 前后的 `ENUM:` 行，或看 HUB 报的是 `FS` / `LS` 还是 `HS`。
+
 ### 坑 15：单路 USB PHY 只能二选一（Host / Device）
 
 **现象**：把 USB 口当 Host 用之后，串口（CDC）没了。

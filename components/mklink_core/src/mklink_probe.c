@@ -458,9 +458,9 @@ void mklink_probe_attach(void)
 
     mklink_cdc_group_t *g = &groups[pick];
     if (g->comm_iface != 0xFF) {
-        (void)mklink_usb_claim_interface(g->comm_iface);
+        (void)mklink_usb_claim_interface(addr, g->comm_iface);
     }
-    if (mklink_usb_claim_interface(g->data_iface) != ESP_OK) {
+    if (mklink_usb_claim_interface(addr, g->data_iface) != ESP_OK) {
         mklink_log("PROBE: claim if%u failed", g->data_iface);
         return;
     }
@@ -525,10 +525,10 @@ void mklink_probe_detach(void)
 
     /* Give the interfaces back so another owner (usbip) can claim them. */
     if (comm != 0xFF) {
-        mklink_usb_release_interface(comm);
+        mklink_usb_release_interface(addr, comm);
     }
     if (data != 0xFF && data != comm) {
-        mklink_usb_release_interface(data);
+        mklink_usb_release_interface(addr, data);
     }
 
     s_addr = MKLINK_USB_ADDR_NONE;

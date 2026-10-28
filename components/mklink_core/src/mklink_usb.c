@@ -1,14 +1,17 @@
 /*
- * MKLink Remote - USB host bridge.
+ * MKLink Remote - USB host bridge (multi-device).
  *
  * Design notes:
  *  - The USB host library is installed here instead of using the BSP helper,
  *    because the BSP's library task calls usb_host_device_free_all() whenever
  *    the "no clients" flag is raised, which would race with our persistent
  *    client during boot.
- *  - Interfaces are *not* claimed while enumerating. The CDC loopback test (and
- *    the future usbip server) claims only what it needs, so the raw transfer
- *    layer stays usable for a network passthrough.
+ *  - Devices are tracked in a small table so several devices behind a hub can be
+ *    exported at once by the usbip server. Each slot owns its handle, descriptor
+ *    snapshot, endpoint table and claim mask; the raw transfer layer addresses a
+ *    slot purely by its USB device address.
+ *  - Interfaces are *not* claimed while enumerating: usbip claims what it needs
+ *    per connection, so the raw layer stays usable for a network passthrough.
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -33,35 +36,36 @@
 
 static const char *TAG = "mklink.usb";
 
-#define MK_MAX_ENDPOINTS  16
-#define MK_DESC_DUMP_LEN  512
+#define MK_MAX_ENDPOINTS      16
+#define MK_DESC_DUMP_LEN      512
+#define MKLINK_USB_MAX_DEVICES 8
 
 static usb_host_client_handle_t s_client;
 static TaskHandle_t s_lib_task;
 static TaskHandle_t s_client_task;
 
-static usb_device_handle_t s_dev_hdl;
-static uint8_t s_dev_addr = MKLINK_USB_ADDR_NONE;
-static uint32_t s_claimed_mask;
-static mklink_usb_snapshot_t s_snap;
-static mklink_ep_info_t s_eps[MK_MAX_ENDPOINTS];
-static int s_ep_count;
-static uint8_t s_cdc_comm_iface = 0xFF;
-static uint8_t s_cdc_data_iface = 0xFF;
-static uint8_t s_iface_cls[32];
-static mklink_cdc_group_t s_cdc_groups[MKLINK_MAX_CDC_GROUPS];
-static uint8_t s_cdc_group_count;
-static char s_desc_dump[MK_DESC_DUMP_LEN + 1];
+typedef struct {
+    bool     used;
+    volatile bool alive;
+    uint8_t  addr;
+    usb_device_handle_t hdl;
+    uint32_t claimed_mask;
+    mklink_usb_snapshot_t snap;
+    mklink_ep_info_t eps[MK_MAX_ENDPOINTS];
+    int      ep_count;
+    uint8_t  iface_cls[32];
+    mklink_cdc_group_t cdc[MKLINK_MAX_CDC_GROUPS];
+    uint8_t  cdc_count;
+    char     desc_dump[MK_DESC_DUMP_LEN + 1];
+} usb_slot_t;
+
+static usb_slot_t s_slots[MKLINK_USB_MAX_DEVICES];
+static int s_pending_slot = -1;
 static SemaphoreHandle_t s_lock;
 
-/* Device lifetime: s_dev_alive is cleared the moment the stack reports DEV_GONE
- * so no new transfer can be submitted, and the actual release/close happens later
- * from a teardown task (never inside the client callback). */
-static volatile bool s_dev_alive;
-static volatile bool s_teardown_pending;
-static uint32_t s_dev_gen;
+/* In-flight transfer accounting, used to delay device teardown until aborted
+ * transfers delivered their callbacks. */
 static volatile int s_xfer_inflight;
-static uint8_t s_deferred_addr = MKLINK_USB_ADDR_NONE;
 
 static void lock_init(void)
 {
@@ -83,6 +87,69 @@ static void unlock(void)
     if (s_lock != NULL) {
         xSemaphoreGive(s_lock);
     }
+}
+
+/* ------------------------------------------------------------- slot helpers */
+
+static void slot_clear_locked(usb_slot_t *s)
+{
+    s->used = false;
+    s->alive = false;
+    s->addr = MKLINK_USB_ADDR_NONE;
+    s->hdl = NULL;
+    s->claimed_mask = 0;
+    s->ep_count = 0;
+    s->cdc_count = 0;
+    memset(s->cdc, 0, sizeof(s->cdc));
+    memset(s->eps, 0, sizeof(s->eps));
+    memset(s->iface_cls, 0xFF, sizeof(s->iface_cls));
+    memset(&s->snap, 0, sizeof(s->snap));
+    s->snap.cdc_iface = 0xFF;
+    s->desc_dump[0] = '\0';
+}
+
+static usb_slot_t *slot_by_addr_locked(uint8_t addr)
+{
+    for (int i = 0; i < MKLINK_USB_MAX_DEVICES; i++) {
+        if (s_slots[i].used && s_slots[i].addr == addr) {
+            return &s_slots[i];
+        }
+    }
+    return NULL;
+}
+
+static usb_slot_t *slot_free_locked(void)
+{
+    for (int i = 0; i < MKLINK_USB_MAX_DEVICES; i++) {
+        if (!s_slots[i].used) {
+            return &s_slots[i];
+        }
+    }
+    return NULL;
+}
+
+static usb_slot_t *slot_first_locked(void)
+{
+    for (int i = 0; i < MKLINK_USB_MAX_DEVICES; i++) {
+        if (s_slots[i].used) {
+            return &s_slots[i];
+        }
+    }
+    return NULL;
+}
+
+static usb_slot_t *slot_nth_locked(int idx)
+{
+    int n = 0;
+    for (int i = 0; i < MKLINK_USB_MAX_DEVICES; i++) {
+        if (!s_slots[i].used) {
+            continue;
+        }
+        if (n++ == idx) {
+            return &s_slots[i];
+        }
+    }
+    return NULL;
 }
 
 int mklink_utf16_to_utf8(const uint16_t *src, int src_len, char *dst, size_t dst_len)
@@ -136,30 +203,13 @@ static void append(char *buf, size_t len, const char *fmt, ...)
     va_end(args);
 }
 
-/* Device table / descriptor formatting now lives next to mklink_usb_describe(). */
-
-/* Reset the bookkeeping only - the caller owns handle/interface teardown. */
-static void clear_state_locked(void)
-{
-    s_dev_hdl = NULL;
-    s_dev_addr = MKLINK_USB_ADDR_NONE;
-    s_claimed_mask = 0;
-    s_ep_count = 0;
-    s_cdc_comm_iface = 0xFF;
-    s_cdc_data_iface = 0xFF;
-    s_cdc_group_count = 0;
-    memset(s_cdc_groups, 0, sizeof(s_cdc_groups));
-    s_dev_alive = false;
-    memset(s_iface_cls, 0xFF, sizeof(s_iface_cls));
-    memset(&s_snap, 0, sizeof(s_snap));
-    s_snap.cdc_iface = 0xFF;
-    s_desc_dump[0] = '\0';
-    mklink_cdc_store_result(NULL);
-}
-
 bool mklink_usb_device_alive(uint8_t dev_addr)
 {
-    return s_dev_alive && (s_dev_addr == dev_addr);
+    lock();
+    usb_slot_t *s = slot_by_addr_locked(dev_addr);
+    bool alive = (s != NULL && s->alive);
+    unlock();
+    return alive;
 }
 
 void mklink_usb_xfer_begin(void)
@@ -175,29 +225,15 @@ void mklink_usb_xfer_end(void)
 bool mklink_usb_busy(void)
 {
     lock();
-    bool busy = (s_dev_hdl != NULL);
+    bool busy = (slot_free_locked() == NULL);
     unlock();
     return busy;
 }
 
 static void on_device_connected(uint8_t dev_addr)
 {
-    lock();
-    bool busy = (s_dev_hdl != NULL);
-    bool tearing_down = s_teardown_pending;
-    if (tearing_down) {
-        /* Remember it: the teardown task retries once the handle is closed. */
-        s_deferred_addr = dev_addr;
-    }
-    unlock();
-    if (busy || tearing_down) {
-        mklink_log("USB: device addr %u %s", dev_addr,
-                   busy ? "ignored (another device already attached)" : "deferred (teardown in progress)");
-        return;
-    }
-
-    /* Probe auto-discovery decides whether this device is our command bridge;
-     * it describes the device, probes the CDC groups and adopts it on success. */
+    /* Probe auto-discovery decides what to do with this device: it describes it
+     * and adopts it into a free slot (probe bridge or generic passthrough). */
     mklink_discovery_on_device(dev_addr);
 }
 
@@ -229,9 +265,11 @@ esp_err_t mklink_usb_describe(uint8_t addr, mklink_usb_desc_t *out)
     out->hdl = hdl;
     out->vid = dd->idVendor;
     out->pid = dd->idProduct;
+    out->dev_class = dd->bDeviceClass;
 
     /* Walk the raw descriptor chain: simpler and more robust than type lookups. */
     uint8_t iface_order[32];
+    bool    iface_seen[32] = {false};
     int iface_order_n = 0;
     uint8_t iface_num = 0;
     memset(out->iface_cls, 0xFF, sizeof(out->iface_cls));
@@ -245,12 +283,19 @@ esp_err_t mklink_usb_describe(uint8_t addr, mklink_usb_desc_t *out)
             break;
         }
         if (dtype == USB_B_DESCRIPTOR_TYPE_INTERFACE && dlen >= 9) {
-            iface_num = p[2];
-            out->iface_cnt++;
-            if (iface_num < 32) {
-                out->iface_cls[iface_num] = p[5];
-                if (iface_order_n < (int)sizeof(iface_order)) {
-                    iface_order[iface_order_n++] = iface_num;
+            uint8_t n = p[2];
+            iface_num = n;
+            if (n < 32) {
+                /* Alternate settings repeat bInterfaceNumber, so dedupe with an
+                 * explicit bitmap. Using iface_cls[n]==0xFF as the sentinel broke
+                 * vendor-specific devices (their interface class really is 0xFF):
+                 * every alternate setting looked new and was claimed repeatedly. */
+                if (!iface_seen[n]) {
+                    iface_seen[n] = true;
+                    out->iface_cls[n] = p[5];
+                    if (iface_order_n < (int)sizeof(iface_order)) {
+                        iface_order[iface_order_n++] = n;
+                    }
                 }
             }
         } else if (dtype == USB_B_DESCRIPTOR_TYPE_ENDPOINT && dlen >= 7 && out->ep_count < MK_MAX_ENDPOINTS) {
@@ -264,6 +309,9 @@ esp_err_t mklink_usb_describe(uint8_t addr, mklink_usb_desc_t *out)
         }
         p += dlen;
     }
+
+    /* bNumInterfaces is authoritative (it excludes alternate settings). */
+    out->iface_cnt = cd->bNumInterfaces;
 
     /* CDC functions: a data interface (0x0A) follows its communication interface
      * (0x02). Composite probes expose several of them, and only one carries the
@@ -361,36 +409,37 @@ esp_err_t mklink_usb_adopt(mklink_usb_desc_t *desc)
     }
 
     lock();
-    if (s_dev_hdl != NULL) {
+    usb_slot_t *s = slot_free_locked();
+    if (s == NULL) {
         unlock();
-        return ESP_ERR_INVALID_STATE;
+        return ESP_ERR_NO_MEM;
     }
 
-    s_dev_hdl = desc->hdl;
-    desc->hdl = NULL;              /* ownership moved to the bridge */
-    s_dev_addr = desc->addr;
-    s_ep_count = desc->ep_count;
-    memcpy(s_eps, desc->eps, sizeof(mklink_ep_info_t) * desc->ep_count);
-    memcpy(s_iface_cls, desc->iface_cls, sizeof(s_iface_cls));
-    memcpy(s_cdc_groups, desc->cdc, sizeof(mklink_cdc_group_t) * desc->cdc_count);
-    s_cdc_group_count = desc->cdc_count;
-    s_cdc_comm_iface = desc->cdc_count ? desc->cdc[0].comm_iface : 0xFF;
-    s_cdc_data_iface = desc->cdc_count ? desc->cdc[0].data_iface : 0xFF;
+    s->used = true;
+    s->alive = false;              /* published by confirm_adopted() */
+    s->addr = desc->addr;
+    s->hdl = desc->hdl;
+    desc->hdl = NULL;              /* ownership moved to the slot */
+    s->ep_count = desc->ep_count;
+    s->cdc_count = desc->cdc_count;
+    memcpy(s->eps, desc->eps, sizeof(mklink_ep_info_t) * desc->ep_count);
+    memcpy(s->iface_cls, desc->iface_cls, sizeof(s->iface_cls));
+    memcpy(s->cdc, desc->cdc, sizeof(mklink_cdc_group_t) * desc->cdc_count);
+    s->claimed_mask = 0;
 
-    memset(&s_snap, 0, sizeof(s_snap));
-    s_snap.connected = true;
-    s_snap.vid = desc->vid;
-    s_snap.pid = desc->pid;
-    s_snap.dev_addr = desc->addr;
-    s_snap.iface_cnt = desc->iface_cnt;
-    s_snap.ep_cnt = desc->ep_count;
-    s_snap.cdc_iface = desc->cdc_count ? cdc_group_cmd_iface(&desc->cdc[0]) : 0xFF;
-    strlcpy(s_snap.manufacturer, desc->manufacturer, sizeof(s_snap.manufacturer));
-    strlcpy(s_snap.product, desc->product, sizeof(s_snap.product));
+    memset(&s->snap, 0, sizeof(s->snap));
+    s->snap.connected = true;
+    s->snap.vid = desc->vid;
+    s->snap.pid = desc->pid;
+    s->snap.dev_addr = desc->addr;
+    s->snap.iface_cnt = desc->iface_cnt;
+    s->snap.ep_cnt = desc->ep_count;
+    s->snap.cdc_iface = desc->cdc_count ? cdc_group_cmd_iface(&desc->cdc[0]) : 0xFF;
+    strlcpy(s->snap.manufacturer, desc->manufacturer, sizeof(s->snap.manufacturer));
+    strlcpy(s->snap.product, desc->product, sizeof(s->snap.product));
+    strlcpy(s->desc_dump, desc->topology, sizeof(s->desc_dump));
 
-    strlcpy(s_desc_dump, desc->topology, sizeof(s_desc_dump));
-    s_dev_alive = true;
-    s_dev_gen++;
+    s_pending_slot = (int)(s - s_slots);
     unlock();
 
     return ESP_OK;
@@ -399,11 +448,17 @@ esp_err_t mklink_usb_adopt(mklink_usb_desc_t *desc)
 void mklink_usb_confirm_adopted(void)
 {
     mklink_usb_snapshot_t snap;
-    char dump_copy[sizeof(s_desc_dump)];
+    char dump_copy[MK_DESC_DUMP_LEN + 1];
 
     lock();
-    snap = s_snap;
-    strlcpy(dump_copy, s_desc_dump, sizeof(dump_copy));
+    usb_slot_t *s = (s_pending_slot >= 0) ? &s_slots[s_pending_slot] : NULL;
+    if (s == NULL || !s->used) {
+        unlock();
+        return;
+    }
+    s->alive = true;
+    snap = s->snap;
+    strlcpy(dump_copy, s->desc_dump, sizeof(dump_copy));
     unlock();
 
     mklink_log("USB: %04X:%04X \"%s\" addr=%u if=%u ep=%u",
@@ -426,16 +481,24 @@ void mklink_usb_confirm_adopted(void)
         mklink_cdc_test_start();
     }
 #endif
+
+    lock();
+    s_pending_slot = -1;
+    unlock();
 }
 
 void mklink_usb_discard_adopted(void)
 {
-    usb_device_handle_t hdl;
-
-    mklink_probe_detach();
+    usb_device_handle_t hdl = NULL;
+    usb_slot_t *s = NULL;
 
     lock();
-    hdl = s_dev_hdl;
+    if (s_pending_slot >= 0) {
+        s = &s_slots[s_pending_slot];
+        hdl = s->hdl;
+        slot_clear_locked(s);
+        s_pending_slot = -1;
+    }
     unlock();
 
     if (hdl == NULL) {
@@ -446,20 +509,18 @@ void mklink_usb_discard_adopted(void)
         usb_host_interface_release(s_client, hdl, i);
     }
     usb_host_device_close(s_client, hdl);
-
-    lock();
-    clear_state_locked();
-    unlock();
-
     ESP_LOGD(TAG, "device discarded (failed validation)");
 }
 
 int mklink_usb_cdc_group_list(mklink_cdc_group_t *out, size_t max)
 {
     lock();
+    usb_slot_t *s = slot_first_locked();
     int n = 0;
-    for (int i = 0; i < s_cdc_group_count && (size_t)i < max; i++) {
-        out[n++] = s_cdc_groups[i];
+    if (s != NULL) {
+        for (int i = 0; i < s->cdc_count && (size_t)i < max; i++) {
+            out[n++] = s->cdc[i];
+        }
     }
     unlock();
     return n;
@@ -494,7 +555,7 @@ static void teardown_run(teardown_job_t *job)
         ESP_LOGW(TAG, "teardown: %d transfer(s) still in flight", s_xfer_inflight);
     }
 
-    /* Release every interface: the CDC task may have claimed one between the
+    /* Release every interface: a consumer may have claimed one between the
      * snapshot and the removal, and a stuck claim makes device_close fail. */
     for (int i = 0; i < 32; i++) {
         esp_err_t err = usb_host_interface_release(s_client, job->hdl, i);
@@ -509,20 +570,8 @@ static void teardown_run(teardown_job_t *job)
         ESP_LOGW(TAG, "device close addr=%u: %s", job->addr, esp_err_to_name(err));
     }
 
-    uint8_t deferred = MKLINK_USB_ADDR_NONE;
-    lock();
-    s_teardown_pending = false;
-    deferred = s_deferred_addr;
-    s_deferred_addr = MKLINK_USB_ADDR_NONE;
-    unlock();
-
     ESP_LOGD(TAG, "teardown done (heap %u)", (unsigned)esp_get_free_heap_size());
     free(job);
-
-    /* A device that showed up while we were tearing down was skipped; retry now. */
-    if (deferred != MKLINK_USB_ADDR_NONE) {
-        on_device_connected(deferred);
-    }
 }
 
 static void usb_teardown_task(void *arg)
@@ -539,39 +588,34 @@ static void on_device_gone(uint8_t dev_addr)
         return;
     }
 
+    mklink_usb_snapshot_t snap;
+    bool found = false;
+
     lock();
-    if (s_dev_hdl == NULL || s_dev_addr != dev_addr) {
-        unlock();
+    usb_slot_t *s = slot_by_addr_locked(dev_addr);
+    if (s != NULL) {
+        s->alive = false;          /* block new submissions immediately */
+        snap = s->snap;
+        job->hdl = s->hdl;
+        job->claimed_mask = s->claimed_mask;
+        job->addr = dev_addr;
+        slot_clear_locked(s);      /* free the slot right away */
+        found = true;
+    }
+    unlock();
+
+    if (!found || job->hdl == NULL) {
         free(job);
         return;
     }
-
-    /* Block every new submission first, then hand the handle to the job. */
-    s_dev_alive = false;
-    s_dev_gen++;
-    s_teardown_pending = true;
-
-    mklink_probe_detach();
-
-    mklink_usb_snapshot_t snap = s_snap;
-    job->hdl = s_dev_hdl;
-    job->claimed_mask = s_claimed_mask;
-    job->addr = dev_addr;
-
-    s_dev_hdl = NULL;
-    s_claimed_mask = 0;
-    clear_state_locked();
-    unlock();
 
     mklink_log("USB: device addr=%u removed", dev_addr);
     esp_event_post(MKLINK_EVENT, MKLINK_EVENT_USB_REMOVED, &snap, sizeof(snap), 0);
 
     /* NOTE: do NOT flush endpoints here. usb_host_endpoint_flush() is serviced
      * by the client task itself, and this callback runs inside it - calling it
-     * deadlocks the client, after which no USB event (including a re-plug) is
-     * ever delivered again. The stack already flushes and retires every URB of
-     * a removed device by itself, invoking their callbacks. */
-
+     * deadlocks the client, after which no USB event is ever delivered again.
+     * The stack already flushes and retires every URB of a removed device. */
     if (xTaskCreate(usb_teardown_task, "mk_usb_teardown", 3072, job, 5, NULL) != pdPASS) {
         ESP_LOGW(TAG, "teardown task creation failed, closing inline");
         teardown_run(job);
@@ -584,11 +628,22 @@ static void client_event_cb(const usb_host_client_event_msg_t *event_msg, void *
     case USB_HOST_CLIENT_EVENT_NEW_DEV:
         on_device_connected(event_msg->new_dev.address);
         break;
-    case USB_HOST_CLIENT_EVENT_DEV_GONE:
-        if (event_msg->dev_gone.dev_hdl == s_dev_hdl) {
-            on_device_gone(s_dev_addr);
+    case USB_HOST_CLIENT_EVENT_DEV_GONE: {
+        /* The event only carries the handle: map it back to an address. */
+        uint8_t addr = MKLINK_USB_ADDR_NONE;
+        lock();
+        for (int i = 0; i < MKLINK_USB_MAX_DEVICES; i++) {
+            if (s_slots[i].used && s_slots[i].hdl == event_msg->dev_gone.dev_hdl) {
+                addr = s_slots[i].addr;
+                break;
+            }
+        }
+        unlock();
+        if (addr != MKLINK_USB_ADDR_NONE) {
+            on_device_gone(addr);
         }
         break;
+    }
     default:
         break;
     }
@@ -655,8 +710,11 @@ esp_err_t mklink_usb_start(void)
         return ESP_ERR_NO_MEM;
     }
 
-    memset(&s_snap, 0, sizeof(s_snap));
-    s_snap.cdc_iface = 0xFF;
+    lock();
+    for (int i = 0; i < MKLINK_USB_MAX_DEVICES; i++) {
+        slot_clear_locked(&s_slots[i]);
+    }
+    unlock();
 
     mklink_log("USB: host stack ready (filter %04X:%04X)", CONFIG_MKLINK_USB_VID, CONFIG_MKLINK_USB_PID);
     return mklink_usb_rescan();
@@ -685,14 +743,80 @@ esp_err_t mklink_usb_rescan(void)
     return ESP_OK;
 }
 
+int mklink_usb_device_count(void)
+{
+    lock();
+    int n = 0;
+    for (int i = 0; i < MKLINK_USB_MAX_DEVICES; i++) {
+        if (s_slots[i].used && s_slots[i].alive) {
+            n++;
+        }
+    }
+    unlock();
+    return n;
+}
+
+uint8_t mklink_usb_addr_at(int idx)
+{
+    lock();
+    usb_slot_t *s = slot_nth_locked(idx);
+    uint8_t addr = (s != NULL) ? s->addr : MKLINK_USB_ADDR_NONE;
+    unlock();
+    return addr;
+}
+
+bool mklink_usb_get_snapshot_at(int idx, mklink_usb_snapshot_t *out)
+{
+    if (out == NULL) {
+        return false;
+    }
+    lock();
+    usb_slot_t *s = slot_nth_locked(idx);
+    bool ok = (s != NULL && s->alive);
+    if (ok) {
+        *out = s->snap;
+    }
+    unlock();
+    if (!ok) {
+        memset(out, 0, sizeof(*out));
+        out->cdc_iface = 0xFF;
+    }
+    return ok;
+}
+
+bool mklink_usb_snapshot_for_addr(uint8_t dev_addr, mklink_usb_snapshot_t *out)
+{
+    if (out == NULL) {
+        return false;
+    }
+    lock();
+    usb_slot_t *s = slot_by_addr_locked(dev_addr);
+    bool ok = (s != NULL && s->alive);
+    if (ok) {
+        *out = s->snap;
+    }
+    unlock();
+    if (!ok) {
+        memset(out, 0, sizeof(*out));
+        out->cdc_iface = 0xFF;
+    }
+    return ok;
+}
+
 bool mklink_usb_get_snapshot(mklink_usb_snapshot_t *out)
 {
     if (out == NULL) {
         return false;
     }
     lock();
-    bool connected = s_snap.connected;
-    *out = s_snap;
+    usb_slot_t *s = slot_first_locked();
+    bool connected = (s != NULL && s->alive);
+    if (s != NULL) {
+        *out = s->snap;
+    } else {
+        memset(out, 0, sizeof(*out));
+        out->cdc_iface = 0xFF;
+    }
     unlock();
     return connected;
 }
@@ -703,7 +827,12 @@ size_t mklink_usb_descriptor_dump(char *dst, size_t dst_len)
         return 0;
     }
     lock();
-    strlcpy(dst, s_desc_dump, dst_len);
+    usb_slot_t *s = slot_first_locked();
+    if (s != NULL) {
+        strlcpy(dst, s->desc_dump, dst_len);
+    } else {
+        dst[0] = '\0';
+    }
     size_t len = strlen(dst);
     unlock();
     return len;
@@ -716,32 +845,39 @@ usb_host_client_handle_t mklink_usb_client_handle(void)
 
 uint8_t mklink_usb_current_addr(void)
 {
-    return s_dev_addr;
+    lock();
+    usb_slot_t *s = slot_first_locked();
+    uint8_t addr = (s != NULL) ? s->addr : MKLINK_USB_ADDR_NONE;
+    unlock();
+    return addr;
 }
 
 bool mklink_usb_handle_for_addr(uint8_t dev_addr, usb_device_handle_t *out)
 {
     lock();
-    bool ok = (s_dev_hdl != NULL && s_dev_addr == dev_addr);
+    usb_slot_t *s = slot_by_addr_locked(dev_addr);
+    bool ok = (s != NULL && s->hdl != NULL);
     if (ok && out != NULL) {
-        *out = s_dev_hdl;
+        *out = s->hdl;
     }
     unlock();
     return ok;
 }
 
-esp_err_t mklink_usb_claim_interface(uint8_t iface_num)
+esp_err_t mklink_usb_claim_interface(uint8_t dev_addr, uint8_t iface_num)
 {
-    if (s_dev_hdl == NULL || s_client == NULL) {
-        return ESP_ERR_INVALID_STATE;
-    }
     if (iface_num >= 32) {
         return ESP_ERR_INVALID_ARG;
     }
 
     lock();
-    bool already = (s_claimed_mask & (1u << iface_num)) != 0;
-    usb_device_handle_t hdl = s_dev_hdl;
+    usb_slot_t *s = slot_by_addr_locked(dev_addr);
+    if (s == NULL || s->hdl == NULL) {
+        unlock();
+        return ESP_ERR_INVALID_STATE;
+    }
+    bool already = (s->claimed_mask & (1u << iface_num)) != 0;
+    usb_device_handle_t hdl = s->hdl;
     unlock();
 
     if (already) {
@@ -751,23 +887,31 @@ esp_err_t mklink_usb_claim_interface(uint8_t iface_num)
     esp_err_t err = usb_host_interface_claim(s_client, hdl, iface_num, 0);
     if (err == ESP_OK) {
         lock();
-        s_claimed_mask |= (1u << iface_num);
+        s = slot_by_addr_locked(dev_addr);
+        if (s != NULL) {
+            s->claimed_mask |= (1u << iface_num);
+        }
         unlock();
     }
     return err;
 }
 
-esp_err_t mklink_usb_release_interface(uint8_t iface_num)
+esp_err_t mklink_usb_release_interface(uint8_t dev_addr, uint8_t iface_num)
 {
-    if (s_dev_hdl == NULL || s_client == NULL || iface_num >= 32) {
+    if (iface_num >= 32) {
         return ESP_ERR_INVALID_ARG;
     }
 
     lock();
-    bool claimed = (s_claimed_mask & (1u << iface_num)) != 0;
-    usb_device_handle_t hdl = s_dev_hdl;
+    usb_slot_t *s = slot_by_addr_locked(dev_addr);
+    if (s == NULL || s->hdl == NULL) {
+        unlock();
+        return ESP_ERR_INVALID_ARG;
+    }
+    bool claimed = (s->claimed_mask & (1u << iface_num)) != 0;
+    usb_device_handle_t hdl = s->hdl;
     if (claimed) {
-        s_claimed_mask &= ~(1u << iface_num);
+        s->claimed_mask &= ~(1u << iface_num);
     }
     unlock();
 
@@ -777,22 +921,32 @@ esp_err_t mklink_usb_release_interface(uint8_t iface_num)
 bool mklink_usb_cdc_ifaces(uint8_t *comm, uint8_t *data)
 {
     lock();
+    usb_slot_t *s = slot_first_locked();
+    uint8_t c = 0xFF;
+    uint8_t d = 0xFF;
+    if (s != NULL && s->cdc_count > 0) {
+        c = s->cdc[0].comm_iface;
+        d = s->cdc[0].data_iface;
+    }
+    unlock();
     if (comm != NULL) {
-        *comm = s_cdc_comm_iface;
+        *comm = c;
     }
     if (data != NULL) {
-        *data = s_cdc_data_iface;
+        *data = d;
     }
-    bool found = (s_cdc_data_iface != 0xFF);
-    unlock();
-    return found;
+    return (d != 0xFF);
 }
 
-int mklink_usb_endpoint_list(mklink_ep_info_t *out, size_t max)
+int mklink_usb_endpoint_list(uint8_t dev_addr, mklink_ep_info_t *out, size_t max)
 {
     lock();
-    int count = s_ep_count < (int)max ? s_ep_count : (int)max;
-    memcpy(out, s_eps, sizeof(mklink_ep_info_t) * count);
+    usb_slot_t *s = slot_by_addr_locked(dev_addr);
+    int count = 0;
+    if (s != NULL) {
+        count = s->ep_count < (int)max ? s->ep_count : (int)max;
+        memcpy(out, s->eps, sizeof(mklink_ep_info_t) * count);
+    }
     unlock();
     return count;
 }

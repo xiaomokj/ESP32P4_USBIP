@@ -242,21 +242,31 @@ void UsbipApp::refresh(void)
 
     char buf[96];
 
-    /* ---- USB device ---- */
-    mklink_usb_snapshot_t usb;
-    bool usb_ok = mklink_usb_get_snapshot(&usb);
+    /* ---- USB device(s): every adopted device gets its own busid ---- */
+    int dev_cnt = mklink_usb_device_count();
+    bool usb_ok = (dev_cnt > 0);
     set_bg_color_if_changed(_usb_dot, usb_ok ? COL_OK : COL_DIM);
     if (usb_ok) {
-        set_text_if_changed(_usb_name, usb.product[0] ? usb.product : "USB device");
-        snprintf(buf, sizeof(buf), "%04X : %04X", usb.vid, usb.pid);
+        mklink_usb_snapshot_t first;
+        mklink_usb_get_snapshot_at(0, &first);
+
+        snprintf(buf, sizeof(buf), "%d 个设备", dev_cnt);
+        set_text_if_changed(_usb_name, buf);
+        snprintf(buf, sizeof(buf), "%04X : %04X", first.vid, first.pid);
         set_text_if_changed(_usb_id, buf);
-        if (usb.manufacturer[0]) {
-            snprintf(buf, sizeof(buf), "%s · %u 接口 · %u 端点",
-                     usb.manufacturer, usb.iface_cnt, usb.ep_cnt);
-        } else {
-            snprintf(buf, sizeof(buf), "%u 接口 · %u 端点", usb.iface_cnt, usb.ep_cnt);
+
+        char list[224] = {0};
+        for (int i = 0; i < dev_cnt && i < 4; i++) {
+            mklink_usb_snapshot_t s;
+            if (!mklink_usb_get_snapshot_at(i, &s)) {
+                continue;
+            }
+            char line[72];
+            snprintf(line, sizeof(line), "%s1-%u  %s", (i > 0) ? "\n" : "",
+                     (unsigned)s.dev_addr, s.product[0] ? s.product : "USB device");
+            strncat(list, line, sizeof(list) - strlen(list) - 1);
         }
-        set_text_if_changed(_usb_meta, buf);
+        set_text_if_changed(_usb_meta, list);
         set_text_color_if_changed(_usb_id, COL_ACCENT);
     } else {
         set_text_if_changed(_usb_name, "未连接");
@@ -301,22 +311,25 @@ void UsbipApp::refresh(void)
     /* ---- usbip service ---- */
     bool svc_up = mklink_usbip_running();
     if (svc_up) {
-        snprintf(buf, sizeof(buf), "运行中 · 端口 %u · 设备 %s",
-                 (unsigned)mklink_usbip_port(), usb_ok ? "在线" : "未接入");
+        snprintf(buf, sizeof(buf), "运行中 · 端口 %u · %d 个设备",
+                 (unsigned)mklink_usbip_port(), dev_cnt);
         set_text_if_changed(_svc_status, buf);
-        if (ip != NULL) {
-            snprintf(buf, sizeof(buf), "电脑: usbip attach -r %s -b 1-1", ip);
+        if (ip != NULL && dev_cnt > 0) {
+            snprintf(buf, sizeof(buf), "电脑: usbip attach -r %s -b 1-%u", ip,
+                     (unsigned)mklink_usb_addr_at(0));
+        } else if (ip != NULL) {
+            snprintf(buf, sizeof(buf), "电脑: usbip attach -r %s -b 1-<n>", ip);
         } else {
-            snprintf(buf, sizeof(buf), "电脑: usbip attach -r <IP> -b 1-1");
+            snprintf(buf, sizeof(buf), "电脑: usbip attach -r <IP> -b 1-<n>");
         }
         set_text_if_changed(_svc_hint, buf);
-        set_text_if_changed(_net_hint, "电脑端可直接 attach 本机设备");
+        set_text_if_changed(_net_hint, "每个设备一条 busid，可同时 attach");
         set_text_color_if_changed(_svc_status, COL_OK);
         set_text_if_changed(_svc_btn_label, "停止服务");
         set_bg_color_if_changed(_svc_btn, COL_WARN);
     } else {
         set_text_if_changed(_svc_status, "服务未启动");
-        set_text_if_changed(_svc_hint, "启动后电脑执行: usbip attach -r <IP> -b 1-1");
+        set_text_if_changed(_svc_hint, "启动后电脑执行: usbip list 查看 busid");
         set_text_if_changed(_net_hint, "启动服务后才能远程连接");
         set_text_color_if_changed(_svc_status, COL_MUTED);
         set_text_if_changed(_svc_btn_label, "启动服务");

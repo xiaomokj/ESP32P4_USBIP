@@ -250,7 +250,7 @@ static void cdc_test_task(void *arg)
     }
 
     mklink_ep_info_t eps[16];
-    int ep_count = mklink_usb_endpoint_list(eps, 16);
+    int ep_count = mklink_usb_endpoint_list(addr, eps, 16);
 
     uint8_t ep_out = 0;
     uint8_t ep_in = 0;
@@ -280,14 +280,14 @@ static void cdc_test_task(void *arg)
         goto publish;
     }
 
-    esp_err_t err = mklink_usb_claim_interface(data_iface);
+    esp_err_t err = mklink_usb_claim_interface(addr, data_iface);
     if (err != ESP_OK) {
         snprintf(res.detail, sizeof(res.detail), "claim data if%u: %s", data_iface, esp_err_to_name(err));
         goto publish;
     }
     bool comm_claimed = false;
     if (comm_iface != 0xFF && comm_iface != data_iface) {
-        if (mklink_usb_claim_interface(comm_iface) == ESP_OK) {
+        if (mklink_usb_claim_interface(addr, comm_iface) == ESP_OK) {
             comm_claimed = true;
         }
     }
@@ -342,9 +342,9 @@ static void cdc_test_task(void *arg)
 
 release:
     if (comm_claimed) {
-        mklink_usb_release_interface(comm_iface);
+        mklink_usb_release_interface(addr, comm_iface);
     }
-    mklink_usb_release_interface(data_iface);
+    mklink_usb_release_interface(addr, data_iface);
 
 publish:
     mklink_cdc_store_result(&res);

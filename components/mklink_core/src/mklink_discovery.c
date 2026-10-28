@@ -181,20 +181,19 @@ static bool has_exact_line(const char *response, const char *token)
 /* ---------------------------------------------------------------- probing */
 
 /** Official `_probe_port()`: newline sync -> hello -> identity token. */
-static bool probe_cdc_group(const mklink_cdc_group_t *group, const char **how)
+static bool probe_cdc_group(uint8_t addr, const mklink_cdc_group_t *group, const char **how)
 {
-    uint8_t addr = mklink_usb_current_addr();
     if (addr == MKLINK_USB_ADDR_NONE) {
         return false;
     }
 
     bool comm_claimed = false;
-    if (group->comm_iface != 0xFF && mklink_usb_claim_interface(group->comm_iface) == ESP_OK) {
+    if (group->comm_iface != 0xFF && mklink_usb_claim_interface(addr, group->comm_iface) == ESP_OK) {
         comm_claimed = true;
     }
-    if (mklink_usb_claim_interface(group->data_iface) != ESP_OK) {
+    if (mklink_usb_claim_interface(addr, group->data_iface) != ESP_OK) {
         if (comm_claimed) {
-            mklink_usb_release_interface(group->comm_iface);
+            mklink_usb_release_interface(addr, group->comm_iface);
         }
         return false;
     }
@@ -234,9 +233,9 @@ static bool probe_cdc_group(const mklink_cdc_group_t *group, const char **how)
         ESP_LOGD(TAG, "if%u: no prompt (rx %u bytes)", cfg_iface, (unsigned)strlen(rx));
     }
 
-    mklink_usb_release_interface(group->data_iface);
+    mklink_usb_release_interface(addr, group->data_iface);
     if (comm_claimed) {
-        mklink_usb_release_interface(group->comm_iface);
+        mklink_usb_release_interface(addr, group->comm_iface);
     }
     return ok;
 }
@@ -272,7 +271,13 @@ static void remember_success(uint16_t vid, uint16_t pid, uint8_t cmd_iface)
 static bool discovery_pass(uint8_t addr)
 {
     if (mklink_usb_busy()) {
-        ESP_LOGD(TAG, "addr %u ignored: a device is already active", addr);
+        mklink_log("PROBE: addr %u ignored (device table full)", addr);
+        return false;
+    }
+
+    /* A rescan walks every address, including the ones we already own; opening
+     * an already-open device fails, so skip them instead of logging an error. */
+    if (mklink_usb_device_alive(addr)) {
         return false;
     }
 
@@ -290,9 +295,28 @@ static bool discovery_pass(uint8_t addr)
         return false;
     }
 
+    /* A hub is bus infrastructure, not an exportable device: skip it and let the
+     * devices behind it be enumerated one by one. */
+    bool is_hub = (desc.dev_class == 0x09);
+    for (int i = 0; i < 32 && !is_hub; i++) {
+        if (desc.iface_cls[i] == 0x09) {
+            is_hub = true;
+        }
+    }
+    if (is_hub) {
+        mklink_log("PROBE: skip %04X:%04X (USB hub)", desc.vid, desc.pid);
+        mklink_usb_desc_release(&desc);
+        return false;
+    }
+
     if (desc.cdc_count == 0) {
-        mklink_log("PROBE: %04X:%04X has no CDC function, not a command bridge",
-                   desc.vid, desc.pid);
+        /* No CDC function: it is not a command bridge, but the generic USBIP app
+         * must still be able to export it (U-disk, HID, network adapter, ...). */
+        if (mklink_usb_adopt(&desc) == ESP_OK) {
+            mklink_usb_confirm_adopted();
+            mklink_log("DEVICE: %04X:%04X adopted (generic usbip)", desc.vid, desc.pid);
+            return true;
+        }
         mklink_usb_desc_release(&desc);
         return false;
     }
@@ -336,7 +360,7 @@ static bool discovery_pass(uint8_t addr)
             }
             probed++;
             how = NULL;
-            if (probe_cdc_group(&desc.cdc[i], &how)) {
+            if (probe_cdc_group(desc.addr, &desc.cdc[i], &how)) {
                 ok = true;
                 mklink_usb_confirm_adopted();
                 remember_success(desc.vid, desc.pid, cmd_iface_of(&desc.cdc[i]));
@@ -349,8 +373,13 @@ static bool discovery_pass(uint8_t addr)
     }
 
     if (!ok) {
-        mklink_usb_discard_adopted();
-        mklink_log("PROBE: %04X:%04X rejected after %d probe(s)", desc.vid, desc.pid, probed);
+        /* It is a CDC device but not the MKLink probe. The generic USBIP app must
+         * still be able to export it (USB-serial adapter, CDC-ECM dock, ...), so
+         * keep it adopted instead of rolling back. */
+        mklink_usb_confirm_adopted();
+        mklink_log("DEVICE: %04X:%04X adopted (generic usbip, %d probe(s) failed)",
+                   desc.vid, desc.pid, probed);
+        return true;
     }
     return ok;
 }
@@ -373,9 +402,8 @@ static void discovery_task(void *arg)
             if (addrs[i] == 0) {
                 continue;
             }
-            if (discovery_pass(addrs[i])) {
-                break; /* one command bridge is enough */
-            }
+            /* Keep going: every device is exported on its own busid. */
+            (void)discovery_pass(addrs[i]);
         }
     }
 

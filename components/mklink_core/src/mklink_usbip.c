@@ -178,6 +178,7 @@ static inline uint16_t be16(uint16_t v) { return __builtin_bswap16(v); }
 typedef struct {
     bool     active;
     uint32_t seqnum;
+    uint32_t devid;        /* echoed back verbatim in RET_SUBMIT */
     uint8_t  ep_addr;      /* actual endpoint address (bit7 = IN) */
     bool     in;           /* IN data direction */
     uint8_t *buf;          /* IN: holds received data until consumed */
@@ -268,13 +269,14 @@ static uint8_t esp_speed_to_usbip(usb_speed_t speed)
  * Fill @p udev and copy the raw device (18 bytes) and config (wTotalLength)
  * descriptors of the active device. Returns 0 on success.
  */
-static int collect_device(usbip_usb_device_t *udev,
+static int collect_device(uint8_t dev_addr,
+                          usbip_usb_device_t *udev,
                           uint8_t *dev_desc, size_t dev_desc_cap,
                           uint8_t *conf_desc, size_t conf_desc_cap,
                           size_t *conf_len_out,
                           usbip_usb_interface_t *uinf, int uinf_max, int *uinf_count)
 {
-    uint8_t addr = mklink_usb_current_addr();
+    uint8_t addr = dev_addr;
     if (addr == MKLINK_USB_ADDR_NONE) {
         return -1;
     }
@@ -299,10 +301,10 @@ static int collect_device(usbip_usb_device_t *udev,
 
     memset(udev, 0, sizeof(*udev));
     snprintf(udev->path, sizeof(udev->path),
-             "/sys/devices/platform/mklink/1-1");
-    strlcpy(udev->busid, "1-1", sizeof(udev->busid));
+             "/sys/devices/platform/mklink/1-%u", (unsigned)addr);
+    snprintf(udev->busid, sizeof(udev->busid), "1-%u", (unsigned)addr);
     udev->busnum = 1;
-    udev->devnum = 1;
+    udev->devnum = addr;
     udev->speed  = esp_speed_to_usbip(info.speed);
     udev->idVendor  = dd->idVendor;
     udev->idProduct = dd->idProduct;
@@ -369,49 +371,64 @@ static void pack_usb_device(usbip_usb_device_t *udev)
 
 static int send_devlist_reply(int s)
 {
-    usbip_usb_device_t udev;
-    usbip_usb_interface_t uinf[16];
-    uint8_t dev_desc[18];
-    int uinf_count = 0;
-
-    int have = collect_device(&udev, dev_desc, sizeof(dev_desc),
-                              NULL, 0, NULL, uinf, 16, &uinf_count);
-    if (have != 0) {
-        if (send_op_common(s, OP_REP_DEVLIST, ST_OK) != 0) {
-            return -1;
-        }
-        uint32_t ndev = be32(0);
-        return send_all(s, &ndev, sizeof(ndev));
-    }
-
     if (send_op_common(s, OP_REP_DEVLIST, ST_OK) != 0) {
         return -1;
     }
 
-    uint32_t ndev = be32(1);
+    /* Every adopted device is exported on its own busid ("1-<addr>"). */
+    int total = mklink_usb_device_count();
+    uint32_t ndev = be32((uint32_t)total);
     if (send_all(s, &ndev, sizeof(ndev)) != 0) {
         return -1;
     }
 
-    pack_usb_device(&udev);
-    if (send_all(s, &udev, sizeof(udev)) != 0) {
-        return -1;
-    }
-    if (uinf_count > 0) {
-        if (send_all(s, uinf, sizeof(usbip_usb_interface_t) * (size_t)uinf_count) != 0) {
+    for (int i = 0; i < total; i++) {
+        uint8_t addr = mklink_usb_addr_at(i);
+        usbip_usb_device_t udev;
+        usbip_usb_interface_t uinf[32];
+        int uinf_count = 0;
+
+        memset(&udev, 0, sizeof(udev));
+        (void)collect_device(addr, &udev, NULL, 0, NULL, 0, NULL,
+                             uinf, 32, &uinf_count);
+
+        pack_usb_device(&udev);
+        if (send_all(s, &udev, sizeof(udev)) != 0) {
+            return -1;
+        }
+        if (uinf_count > 0 &&
+            send_all(s, uinf, sizeof(usbip_usb_interface_t) * (size_t)uinf_count) != 0) {
             return -1;
         }
     }
     return 0;
 }
 
-static int send_import_reply(int s)
+/** Resolve the busid the client asked for ("1-<addr>") to a device address. */
+static uint8_t find_device_by_busid(const char *busid)
+{
+    int total = mklink_usb_device_count();
+    for (int i = 0; i < total; i++) {
+        uint8_t addr = mklink_usb_addr_at(i);
+        if (addr == MKLINK_USB_ADDR_NONE) {
+            continue;
+        }
+        char b[USBIP_BUS_ID_SIZE];
+        snprintf(b, sizeof(b), "1-%u", (unsigned)addr);
+        if (strcmp(b, busid) == 0) {
+            return addr;
+        }
+    }
+    return MKLINK_USB_ADDR_NONE;
+}
+
+static int send_import_reply(int s, uint8_t dev_addr)
 {
     usbip_usb_device_t udev;
-    usbip_usb_interface_t uinf[16];
+    usbip_usb_interface_t uinf[32];
     int uinf_count = 0;
 
-    if (collect_device(&udev, NULL, 0, NULL, 0, NULL, uinf, 16, &uinf_count) != 0) {
+    if (collect_device(dev_addr, &udev, NULL, 0, NULL, 0, NULL, uinf, 32, &uinf_count) != 0) {
         return send_op_common(s, OP_REP_IMPORT, ST_NODEV);
     }
 
@@ -441,7 +458,7 @@ static int send_ret_submit(int s, pending_xfer_t *x)
 
     hdr.base.command   = be32(USBIP_RET_SUBMIT);
     hdr.base.seqnum    = be32(x->seqnum);
-    hdr.base.devid     = be32(0x00010001);
+    hdr.base.devid     = be32(x->devid);
     hdr.base.direction = be32(x->in ? USBIP_DIR_IN : USBIP_DIR_OUT);
     hdr.base.ep        = be32(x->ep_addr & 0x0F);
     hdr.u.ret_submit.status        = be32((uint32_t)status);
@@ -461,13 +478,13 @@ static int send_ret_submit(int s, pending_xfer_t *x)
     return 0;
 }
 
-static int send_ret_unlink(int s, uint32_t seqnum, int32_t status)
+static int send_ret_unlink(int s, uint32_t seqnum, uint32_t devid, int32_t status)
 {
     usbip_header_t hdr;
     memset(&hdr, 0, sizeof(hdr));
     hdr.base.command = be32(USBIP_RET_UNLINK);
     hdr.base.seqnum  = be32(seqnum);
-    hdr.base.devid   = be32(0x00010001);
+    hdr.base.devid   = be32(devid);
     hdr.base.direction = be32(USBIP_DIR_OUT);
     hdr.base.ep      = 0;
     hdr.u.ret_unlink.status = be32((uint32_t)status);
@@ -479,9 +496,10 @@ static int send_ret_unlink(int s, uint32_t seqnum, int32_t status)
 typedef struct {
     pending_xfer_t xfer[MAX_PENDING];
     int count;
+    uint8_t dev_addr;      /* device this connection imported */
 } client_state_t;
 
-static pending_xfer_t *xfer_alloc(client_state_t *cs, uint32_t seqnum,
+static pending_xfer_t *xfer_alloc(client_state_t *cs, uint32_t seqnum, uint32_t devid,
                                   uint8_t ep_addr, bool in, size_t len)
 {
     for (int i = 0; i < MAX_PENDING; i++) {
@@ -490,6 +508,7 @@ static pending_xfer_t *xfer_alloc(client_state_t *cs, uint32_t seqnum,
             memset(x, 0, sizeof(*x));
             x->active = true;
             x->seqnum = seqnum;
+            x->devid = devid;
             x->ep_addr = ep_addr;
             x->in = in;
             x->len = len;
@@ -576,12 +595,13 @@ static int handle_submit(int s, client_state_t *cs, usbip_header_t *hdr)
     bool     control = (ep_num == 0);
     int32_t  len     = sub->transfer_buffer_length;
 
-    uint8_t addr = mklink_usb_current_addr();
+    uint8_t addr = cs->dev_addr;
     if (addr == MKLINK_USB_ADDR_NONE) {
         /* No device: fail the URB immediately. */
         pending_xfer_t tmp;
         memset(&tmp, 0, sizeof(tmp));
         tmp.seqnum = seqnum;
+        tmp.devid = hdr->base.devid;
         tmp.ep_addr = 0;
         tmp.in = dir_in;
         tmp.status = ESP_ERR_NOT_FOUND;
@@ -602,7 +622,7 @@ static int handle_submit(int s, client_state_t *cs, usbip_header_t *hdr)
         memcpy(&setup, sub->setup, 8);
         bool in = (setup.bmRequestType & USB_BM_REQUEST_TYPE_DIR_IN) != 0;
 
-        pending_xfer_t *x = xfer_alloc(cs, seqnum, 0x00, in, (size_t)len);
+        pending_xfer_t *x = xfer_alloc(cs, seqnum, hdr->base.devid, 0x00, in, (size_t)len);
         if (x == NULL) {
             pending_xfer_t tmp;
             memset(&tmp, 0, sizeof(tmp));
@@ -637,7 +657,7 @@ static int handle_submit(int s, client_state_t *cs, usbip_header_t *hdr)
     }
 
     /* Bulk / interrupt. */
-    pending_xfer_t *x = xfer_alloc(cs, seqnum, ep_addr, dir_in, (size_t)len);
+    pending_xfer_t *x = xfer_alloc(cs, seqnum, hdr->base.devid, ep_addr, dir_in, (size_t)len);
     if (x == NULL) {
         pending_xfer_t tmp;
         memset(&tmp, 0, sizeof(tmp));
@@ -678,12 +698,12 @@ static int handle_unlink(int s, client_state_t *cs, usbip_header_t *hdr)
     uint32_t seqnum = hdr->u.cmd_unlink.seqnum;
     pending_xfer_t *x = xfer_find(cs, seqnum);
     if (x != NULL) {
-        uint8_t addr = mklink_usb_current_addr();
+        uint8_t addr = cs->dev_addr;
         if (addr != MKLINK_USB_ADDR_NONE) {
             mklink_usb_raw_abort(addr, x->ep_addr);
         }
     }
-    return send_ret_unlink(s, seqnum, 0);
+    return send_ret_unlink(s, seqnum, hdr->base.devid, 0);
 }
 
 static int handle_one_pdu(int s, client_state_t *cs)
@@ -717,6 +737,7 @@ static void client_task(void *arg)
     int s = (int)(intptr_t)arg;
     client_state_t cs;
     memset(&cs, 0, sizeof(cs));
+    cs.dev_addr = MKLINK_USB_ADDR_NONE;
     bool imported = false;
 
     /* The kernel usbipd sets TCP_NODELAY: a 48-byte header + payload would
@@ -744,9 +765,17 @@ static void client_task(void *arg)
             if (recv_all(s, busid, sizeof(busid)) != 0) {
                 goto done;
             }
-            if (send_import_reply(s) != 0) {
+            busid[sizeof(busid) - 1] = '\0';
+            uint8_t dev_addr = find_device_by_busid(busid);
+            if (dev_addr == MKLINK_USB_ADDR_NONE) {
+                mklink_log("USBIP: import '%s' failed (no such device)", busid);
+                send_op_common(s, OP_REP_IMPORT, ST_NODEV);
                 goto done;
             }
+            if (send_import_reply(s, dev_addr) != 0) {
+                goto done;
+            }
+            cs.dev_addr = dev_addr;
             break;  /* enter the data plane */
         } else {
             send_op_common(s, (uint16_t)(common.code & ~OP_REQUEST), ST_ERROR);
@@ -761,14 +790,14 @@ static void client_task(void *arg)
 
     mklink_usb_snapshot_t snap;
     int iface_cnt = 0;
-    if (mklink_usb_get_snapshot(&snap) && snap.iface_cnt > 0 && snap.iface_cnt <= 32) {
+    if (mklink_usb_snapshot_for_addr(cs.dev_addr, &snap) && snap.iface_cnt > 0 && snap.iface_cnt <= 32) {
         iface_cnt = snap.iface_cnt;
     }
     for (int i = 0; i < iface_cnt; i++) {
-        (void)mklink_usb_claim_interface((uint8_t)i);
+        (void)mklink_usb_claim_interface(cs.dev_addr, (uint8_t)i);
     }
     imported = true;
-    mklink_log("USBIP: client imported the device, forwarding URBs");
+    mklink_log("USBIP: client imported 1-%u, forwarding URBs", (unsigned)cs.dev_addr);
 
     /* ---- data plane ---- */
     for (;;) {
@@ -798,13 +827,12 @@ done:
      * the probe bridge and its claimed interfaces alone, otherwise the next
      * attach runs into "endpoint already allocated" errors. */
     if (imported) {
-        uint8_t addr = mklink_usb_current_addr();
-        if (addr != MKLINK_USB_ADDR_NONE) {
-            mklink_usb_raw_unlink_all(addr);
+        if (cs.dev_addr != MKLINK_USB_ADDR_NONE) {
+            mklink_usb_raw_unlink_all(cs.dev_addr);
         }
         /* Release every interface we claimed (non-claimed ones are a no-op). */
         for (int i = 0; i < 32; i++) {
-            (void)mklink_usb_release_interface((uint8_t)i);
+            (void)mklink_usb_release_interface(cs.dev_addr, (uint8_t)i);
         }
     }
     for (int i = 0; i < MAX_PENDING; i++) {

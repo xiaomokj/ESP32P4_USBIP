@@ -118,6 +118,11 @@ CONFIG_ESP_HOSTED_SDIO_TX_Q_SIZE=10
 # MKLink Remote: USB Host (probe passthrough)
 # ==============================================================================
 CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE=1024
+# External USB hubs (docking stations / USB-HUB): without this the host stack
+# detects the hub but never initializes it, so devices behind it are not
+# enumerated ("External Hubs support disabled, Hub device was not initialized").
+CONFIG_USB_HOST_HUBS_SUPPORTED=y
+CONFIG_USB_HOST_HUB_MULTI_LEVEL=y
 # The CDC loopback test is a bring-up aid only. When the usbip server exports the
 # probe, it must be off: the test claims/releases the CDC interfaces and leaves
 # their endpoints in a state that makes the next usbip claim fail with

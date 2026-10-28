@@ -175,7 +175,7 @@ esp_err_t mklink_usb_raw_unlink_all(uint8_t dev_addr)
     /* Flush every endpoint of the device: pending transfers complete as CANCELED
      * and their contexts are released by the completion callback. */
     mklink_ep_info_t eps[16];
-    int count = mklink_usb_endpoint_list(eps, 16);
+    int count = mklink_usb_endpoint_list(dev_addr, eps, 16);
     esp_err_t result = ESP_ERR_NOT_FOUND;
 
     for (int i = 0; i < count; i++) {
